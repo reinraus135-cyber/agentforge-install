@@ -271,19 +271,51 @@ FunctionEnd
 Function LicensePageLeave
     ${NSD_GetText} $LicenseHwnd $LicenseKey
 
+    ; Empty key -> documented escape hatch (install the CLI now, activate later).
     ${If} $LicenseKey == ""
         MessageBox MB_YESNO|MB_ICONQUESTION "No license key entered.$\r$\n$\r$\nAgentForge needs a license to download your tier's skills and agents. You can continue now and activate later in Ubuntu by running:$\r$\n$\r$\n  ecc activate <your-license-key>$\r$\n$\r$\nContinue without activating?" IDYES lic_skip
         Abort ; stay on the page
         lic_skip:
         StrCpy $SkipActivate "true"
-    ${Else}
-        StrLen $0 $LicenseKey
-        ${If} $0 < 10
-            MessageBox MB_OK|MB_ICONEXCLAMATION "That license key looks too short.$\r$\n$\r$\nPlease paste the full key from your purchase email."
-            Abort ; stay on the page
-        ${EndIf}
-        StrCpy $SkipActivate "false"
+        Return
     ${EndIf}
+
+    StrLen $0 $LicenseKey
+    ${If} $0 < 10
+        MessageBox MB_OK|MB_ICONEXCLAMATION "That license key looks too short.$\r$\n$\r$\nPlease paste the full key from your purchase email."
+        Abort ; stay on the page
+    ${EndIf}
+
+    ; --- LIVE pre-check ---------------------------------------------------------
+    ; Validate the key NOW against LemonSqueezy /validate (non-activating, so it
+    ; does not consume a device slot) so a wrong key is caught here in ~1s instead
+    ; of after the multi-minute install. Runs pre-install, so we use Windows
+    ; PowerShell (no WSL yet). Key passed via env (not the command line); TLS 1.2
+    ; forced for Windows PowerShell 5.1. Output is VALID:<product> / INVALID / NETERR.
+    StrCpy $SkipActivate "false"
+    System::Call 'kernel32::SetEnvironmentVariable(t "AF_LICENSE", t "$LicenseKey")i.r0'
+    nsExec::ExecToStack "powershell -NoProfile -ExecutionPolicy Bypass -Command $\"[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { $$r = Invoke-RestMethod -Method Post -Uri 'https://api.lemonsqueezy.com/v1/licenses/validate' -Body @{license_key=$$env:AF_LICENSE; instance_name='ecc-precheck'} -TimeoutSec 12; if ($$r.valid -eq $$true) { 'VALID:' + $$r.meta.product_name } else { 'INVALID' } } catch { $$c=0; try { $$c=[int]$$_.Exception.Response.StatusCode } catch {}; if ($$c -eq 400 -or $$c -eq 404 -or $$c -eq 422) { 'INVALID' } else { 'NETERR' } }$\""
+    Pop $0 ; exit code
+    Pop $1 ; output (VALID:<product> / INVALID / NETERR)
+    System::Call 'kernel32::SetEnvironmentVariable(t "AF_LICENSE", i 0)i.r0'
+
+    StrCpy $2 $1 6
+    ${If} $2 == "VALID:"
+        StrCpy $4 $1 "" 6 ; product name (trailing newline tolerated)
+        MessageBox MB_OK|MB_ICONINFORMATION "License verified: $4$\r$\nClick Install to set up your environment and download your tier."
+        Return
+    ${EndIf}
+
+    StrCpy $3 $1 7
+    ${If} $3 == "INVALID"
+        MessageBox MB_OK|MB_ICONSTOP "This license key isn't valid -- it may be mistyped, expired, or disabled.$\r$\n$\r$\nPlease re-check the key from your AgentForge purchase email and try again."
+        Abort ; reject -- stay on the page
+    ${EndIf}
+
+    ; NETERR / unexpected -> could not verify (offline?). Let the buyer decide.
+    MessageBox MB_YESNO|MB_ICONEXCLAMATION "Couldn't reach the license server to verify your key -- you may be offline.$\r$\n$\r$\nYou can continue (activation is retried during install), or fix your connection and click Next again.$\r$\n$\r$\nContinue anyway?" IDYES precheck_net_ok
+    Abort ; stay on the page
+    precheck_net_ok:
 FunctionEnd
 
 ; ---------------------------------------------------------------
