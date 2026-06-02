@@ -1,0 +1,1335 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Optional support log: when ECC_LOG is set (e.g. by the Windows installer), tee
+# all output to that file so a failed run can hand back one file. Opt-in and unset
+# by default, so normal and test runs are unaffected. Best-effort -- the installer's
+# NSIS Details capture remains the authoritative log.
+if [ -n "${ECC_LOG:-}" ] && mkdir -p "$(dirname "$ECC_LOG")" 2>/dev/null; then
+  exec > >(tee -a "$ECC_LOG") 2>&1
+fi
+
+ECC_VERSION="2.1.0"
+ECC_DIR="${ECC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+MANIFEST="$ECC_DIR/manifest.json"
+CLAUDE_DIR="$HOME/.claude"
+ECC_CONFIG="$HOME/.ecc"
+LICENSE_FILE="$ECC_CONFIG/license.json"
+REGISTRY_FILE="$ECC_CONFIG/registry.json"
+CACHE_DIR="$ECC_CONFIG/cache"
+CONTENT_DIR="$CACHE_DIR/content"
+DEFAULT_BUY_URL="https://agentforge.army/buy"
+BOOTSTRAP_REPO="https://github.com/reinraus135-cyber/agentforge-install.git"
+FETCH_URL="${AGENTFORGE_FETCH_URL:-https://agentforge.army/api/fetch}"
+
+# Installable content (src/, templates/, scripts/security) lives EITHER in a local
+# checkout (dev / all-in-one private repo -- keeps offline use and tests working) OR in
+# the fetched-and-unpacked cache at $CONTENT_DIR. These are pointed at the resolved root
+# by resolve_content_root() before any install/update primitive runs.
+CONTENT_ROOT="$ECC_DIR"
+SRC_DIR="$ECC_DIR/src"
+TEMPLATES_DIR="$ECC_DIR/templates"
+SECURITY_DIR="$ECC_DIR/scripts/security"
+
+# -- Colors --
+if [ -t 1 ] && command -v tput &>/dev/null; then
+  GREEN=$(tput setaf 2)
+  YELLOW=$(tput setaf 3)
+  RED=$(tput setaf 1)
+  BLUE=$(tput setaf 4)
+  PURPLE=$(tput setaf 5)
+  BOLD=$(tput bold)
+  DIM=$(tput dim)
+  RESET=$(tput sgr0)
+else
+  GREEN="" YELLOW="" RED="" BLUE="" PURPLE="" BOLD="" DIM="" RESET=""
+fi
+
+print_ok()     { echo "${GREEN}[OK]${RESET}   $*"; }
+print_warn()   { echo "${YELLOW}[WARN]${RESET} $*"; }
+print_err()    { echo "${RED}[ERR]${RESET}  $*" >&2; }
+print_info()   { echo "${DIM}[--]${RESET}   $*"; }
+print_header() { echo ""; echo "${BOLD}$*${RESET}"; echo "$(printf '%.0s-' {1..40})"; }
+print_step()   { echo "${BLUE}[$1/$2]${RESET} $3"; }
+
+# -- Dependency checks --
+require_jq() {
+  if ! command -v jq &>/dev/null; then
+    print_err "jq is required but not installed."
+    print_info "Install with: sudo apt install jq"
+    exit 1
+  fi
+}
+
+require_manifest() {
+  if [ ! -f "$MANIFEST" ]; then
+    print_err "manifest.json not found at $MANIFEST"
+    print_info "Re-clone AgentForge: git clone $BOOTSTRAP_REPO ~/AgentForge"
+    exit 1
+  fi
+}
+
+# True when a local content checkout exists (dev / all-in-one repo, tests). When true,
+# no server fetch is needed -- content is read straight from the repo.
+have_local_content() { [ -d "$ECC_DIR/src/skills" ]; }
+
+# Point SRC_DIR / TEMPLATES_DIR / SECURITY_DIR at whichever content root is available:
+# a local checkout if present, else the fetched cache. CONTENT_ROOT is empty when
+# neither exists yet (caller must fetch).
+resolve_content_root() {
+  if have_local_content; then
+    CONTENT_ROOT="$ECC_DIR"
+  elif [ -d "$CONTENT_DIR/src/skills" ]; then
+    CONTENT_ROOT="$CONTENT_DIR"
+  else
+    CONTENT_ROOT=""
+  fi
+  if [ -n "$CONTENT_ROOT" ]; then
+    SRC_DIR="$CONTENT_ROOT/src"
+    TEMPLATES_DIR="$CONTENT_ROOT/templates"
+    SECURITY_DIR="$CONTENT_ROOT/scripts/security"
+  fi
+}
+
+# Gate for commands that need installable content. Satisfied when content is present
+# locally/cached, OR when an active license exists to fetch it with. AgentForge is a
+# paid product: no content without a license.
+require_content() {
+  resolve_content_root
+  [ -n "$CONTENT_ROOT" ] && return 0
+  if [ -f "$LICENSE_FILE" ] && [ "$(license_read_field status)" = "active" ]; then
+    return 0
+  fi
+  print_err "No AgentForge content installed yet."
+  print_info "Activate your license to download it: ecc activate <your-license-key>"
+  print_info "Buy at: $(manifest_buy_url)"
+  exit 1
+}
+
+require_curl_jq_for_fetch() {
+  command -v curl &>/dev/null     || { print_err "curl is required to download content"; return 1; }
+  command -v jq &>/dev/null       || { print_err "jq is required"; return 1; }
+  command -v tar &>/dev/null      || { print_err "tar is required to unpack content"; return 1; }
+  command -v sha256sum &>/dev/null || { print_err "sha256sum is required to verify content"; return 1; }
+  return 0
+}
+
+# -- Manifest helpers (v2 schema: .skus, .templates) --
+
+# resolve_sku_chain "pro" -> "starter\nbuilder\npro" (in include order, transitive)
+resolve_sku_chain() {
+  local sku="$1"
+  local includes
+  includes=$(jq -r ".skus.\"${sku}\".includes_skus[]?" "$MANIFEST" 2>/dev/null)
+  for inc in $includes; do
+    resolve_sku_chain "$inc"
+  done
+  echo "$sku"
+}
+
+# Delta skills declared at one SKU level (not transitive)
+manifest_sku_delta_skills() {
+  jq -r ".skus.\"${1}\".skills[]?" "$MANIFEST" 2>/dev/null
+}
+
+manifest_sku_delta_agents() {
+  jq -r ".skus.\"${1}\".agents[]?" "$MANIFEST" 2>/dev/null
+}
+
+# Effective skills/agents for a SKU (walks includes_skus transitively, dedupes)
+manifest_sku_effective_skills() {
+  resolve_sku_chain "$1" | while read -r s; do
+    [ -z "$s" ] && continue
+    manifest_sku_delta_skills "$s"
+  done | awk '!seen[$0]++'
+}
+
+manifest_sku_effective_agents() {
+  resolve_sku_chain "$1" | while read -r s; do
+    [ -z "$s" ] && continue
+    manifest_sku_delta_agents "$s"
+  done | awk '!seen[$0]++'
+}
+
+# Which SKU declares this skill/agent (lowest in the ladder)
+manifest_skill_sku() {
+  local name="$1"
+  for sku in starter builder pro; do
+    if jq -e ".skus.\"${sku}\".skills | index(\"$name\")" "$MANIFEST" &>/dev/null; then
+      echo "$sku"; return
+    fi
+  done
+  echo "unknown"
+}
+
+manifest_agent_sku() {
+  local name="$1"
+  for sku in starter builder pro; do
+    if jq -e ".skus.\"${sku}\".agents | index(\"$name\")" "$MANIFEST" &>/dev/null; then
+      echo "$sku"; return
+    fi
+  done
+  echo "unknown"
+}
+
+# Templates
+manifest_template_names() {
+  jq -r '.templates | keys[]' "$MANIFEST" 2>/dev/null
+}
+
+manifest_template_status() {
+  jq -r ".templates.\"${1}\".status // \"unknown\"" "$MANIFEST" 2>/dev/null
+}
+
+manifest_template_label() {
+  jq -r ".templates.\"${1}\".label // \"\"" "$MANIFEST" 2>/dev/null
+}
+
+manifest_buy_url() {
+  jq -r ".enforcement.buy_url // \"$DEFAULT_BUY_URL\"" "$MANIFEST" 2>/dev/null
+}
+
+# -- License helpers --
+license_read_field() {
+  if [ -f "$LICENSE_FILE" ]; then
+    jq -r ".$1 // empty" "$LICENSE_FILE" 2>/dev/null
+  fi
+}
+
+license_effective_sku() {
+  if [ ! -f "$LICENSE_FILE" ]; then
+    jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST" 2>/dev/null
+    return
+  fi
+  local status sku
+  status=$(license_read_field "status")
+  sku=$(license_read_field "sku")
+  if [ "$status" != "active" ]; then
+    echo "starter"; return
+  fi
+  echo "${sku:-starter}"
+}
+
+# SKU ladder access check: pro > builder > starter
+# check_sku_access "builder" "pro" => 0 (pro entitles builder content)
+# check_sku_access "pro" "starter" => 1 (starter cannot access pro content)
+check_sku_access() {
+  local required="$1" owned="$2"
+  case "$required" in
+    starter) return 0 ;;
+    builder)
+      case "$owned" in builder|pro) return 0 ;; *) return 1 ;; esac
+      ;;
+    pro)
+      case "$owned" in pro) return 0 ;; *) return 1 ;; esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detect target SKU: AGENTFORGE_SKU env > license SKU > starter fallback
+detect_sku() {
+  if [ -n "${AGENTFORGE_SKU:-}" ]; then
+    case "$AGENTFORGE_SKU" in
+      starter|builder|pro) echo "$AGENTFORGE_SKU"; return ;;
+      *) print_warn "Unknown AGENTFORGE_SKU '$AGENTFORGE_SKU', ignoring" >&2 ;;
+    esac
+  fi
+  license_effective_sku
+}
+
+# -- Registry helpers --
+registry_init() {
+  mkdir -p "$ECC_CONFIG" "$CACHE_DIR"
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    echo '{"ecc_version":"'"$ECC_VERSION"'","sku":"starter","skills":[],"agents":[],"templates":[],"rules":[]}' | jq . > "$REGISTRY_FILE"
+  fi
+}
+
+registry_add() {
+  local field="$1" value="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg v "$value" ".$field += [\$v] | .$field |= unique" "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+registry_save_meta() {
+  local tmp
+  tmp=$(mktemp)
+  jq --arg sku "$1" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.sku = $sku | .installed_at = $ts | .ecc_version = "'"$ECC_VERSION"'"' \
+    "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+registry_list() {
+  jq -r ".$1[]?" "$REGISTRY_FILE" 2>/dev/null
+}
+
+# -- Install primitives --
+install_skill() {
+  local name="$1"
+  local src="$SRC_DIR/skills/$name"
+  local dst="$CLAUDE_DIR/skills/ecc/$name"
+  if [ ! -d "$src" ]; then
+    print_err "Skill source not found: $name"
+    return 1
+  fi
+  mkdir -p "$CLAUDE_DIR/skills/ecc"
+  cp -r "$src" "$dst"
+  registry_add "skills" "$name"
+}
+
+install_agent() {
+  local name="$1"
+  local src="$SRC_DIR/agents/${name}.md"
+  local dst="$CLAUDE_DIR/agents/${name}.md"
+  if [ ! -f "$src" ]; then
+    print_err "Agent source not found: $name"
+    return 1
+  fi
+  mkdir -p "$CLAUDE_DIR/agents"
+  cp "$src" "$dst"
+  registry_add "agents" "$name"
+}
+
+install_rules_all() {
+  local src_rules="$SRC_DIR/rules"
+  local dst_rules="$CLAUDE_DIR/rules/ecc"
+  if [ ! -d "$src_rules" ]; then
+    print_warn "Rules source not found"
+    return 0
+  fi
+  mkdir -p "$dst_rules"
+  cp -r "$src_rules"/. "$dst_rules/"
+  local count
+  count=$(find "$dst_rules" -name "*.md" | wc -l)
+  print_ok "Installed $count rule files"
+}
+
+install_template() {
+  local name="$1"
+  if ! jq -e ".templates.\"${name}\"" "$MANIFEST" &>/dev/null; then
+    print_err "Unknown template: $name"
+    print_info "Available: $(manifest_template_names | tr '\n' ', ' | sed 's/,$//')"
+    return 1
+  fi
+  local status label
+  status=$(manifest_template_status "$name")
+  label=$(manifest_template_label "$name")
+  case "$status" in
+    ready)
+      install_template_files "$name" "$label"
+      ;;
+    in-development|planned)
+      print_warn "Template '$label' status: $status. Available in a future release."
+      ;;
+    *)
+      print_warn "Template '$label' has unknown status: $status"
+      ;;
+  esac
+}
+
+install_template_files() {
+  local name="$1" label="$2"
+  local src_dir="$TEMPLATES_DIR/$name"
+  if [ ! -d "$src_dir" ]; then
+    print_err "Template source not found: $src_dir"
+    print_info "Re-clone or re-run installer to restore templates/"
+    return 1
+  fi
+
+  print_header "Installing template: $label"
+
+  # Show disclaimer prominently if present (trading, prediction-markets)
+  if [ -f "$src_dir/DISCLAIMER.md" ]; then
+    print_warn "This template ships with a DISCLAIMER.md. You are responsible for"
+    print_warn "reading and following it. See $CLAUDE_DIR/templates/$name/DISCLAIMER.md"
+  fi
+
+  # 1. Install template-local agents into ~/.claude/agents/
+  local agent_count=0
+  if [ -d "$src_dir/agents" ]; then
+    mkdir -p "$CLAUDE_DIR/agents"
+    local agent_file
+    for agent_file in "$src_dir/agents"/*.md; do
+      [ -f "$agent_file" ] || continue
+      cp "$agent_file" "$CLAUDE_DIR/agents/"
+      local agent_name
+      agent_name=$(basename "$agent_file" .md)
+      registry_add "agents" "$agent_name"
+      agent_count=$((agent_count + 1))
+    done
+  fi
+
+  # 2. Install template-local skills into ~/.claude/skills/ecc/<name>/SKILL.md
+  local skill_count=0
+  if [ -d "$src_dir/skills" ]; then
+    local skill_file
+    for skill_file in "$src_dir/skills"/*.md; do
+      [ -f "$skill_file" ] || continue
+      local skill_name skill_dst
+      skill_name=$(basename "$skill_file" .md)
+      skill_dst="$CLAUDE_DIR/skills/ecc/$skill_name"
+      mkdir -p "$skill_dst"
+      cp "$skill_file" "$skill_dst/SKILL.md"
+      registry_add "skills" "$skill_name"
+      skill_count=$((skill_count + 1))
+    done
+  fi
+
+  # 3. Copy template metadata (README, WORKFLOW, DISCLAIMER, sample-config, starter-prompt)
+  local template_dst="$CLAUDE_DIR/templates/$name"
+  mkdir -p "$template_dst"
+  local meta_file
+  for meta_file in README.md WORKFLOW.md DISCLAIMER.md sample-config.toml starter-prompt.md; do
+    if [ -f "$src_dir/$meta_file" ]; then
+      cp "$src_dir/$meta_file" "$template_dst/"
+    fi
+  done
+
+  # 4. Register the template
+  registry_add "templates" "$name"
+
+  print_ok "Installed template '$label': $agent_count agents, $skill_count skills"
+  print_info "Workflow:       $template_dst/WORKFLOW.md"
+  print_info "Sample config:  $template_dst/sample-config.toml"
+  print_info "Starter prompt: $template_dst/starter-prompt.md"
+  if [ -f "$template_dst/DISCLAIMER.md" ]; then
+    print_info "DISCLAIMER:     $template_dst/DISCLAIMER.md (read before use)"
+  fi
+}
+
+install_security_hardening() {
+  local mode="${1:-}"
+  print_header "Cybersecurity Hardening (Pro)"
+  local installer="$SECURITY_DIR/install-security.sh"
+  if [ ! -x "$installer" ]; then
+    print_err "Security installer not found or not executable: $installer"
+    print_info "Download Pro content first: ecc activate <your-license-key>"
+    return 1
+  fi
+  print_info "Running $installer ${mode:+$mode}"
+  if [ "$mode" = "--full" ]; then
+    "$installer" --full
+  elif [ "$mode" = "--check" ]; then
+    "$installer" --check
+  else
+    "$installer"
+  fi
+  # Only an actual install applies IOC patches; --check just reports status.
+  if [ "$mode" != "--check" ]; then
+    registry_add "features" "security_hardening"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.ioc_updated_at = $ts' \
+      "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+  fi
+  print_info "Status anytime: ecc security --check"
+}
+
+# -- Content fetch (gated download) --
+
+# A stable per-machine instance name so re-activations map to the same LS device slot.
+content_instance_name() {
+  echo "ecc-$(hostname 2>/dev/null || echo host)-$(id -un 2>/dev/null || echo user)"
+}
+
+# Map (sku, template) -> the release-asset shape the gateway serves.
+content_shape() {
+  local sku="$1" template="${2:-}"
+  case "$sku" in
+    starter) echo "starter" ;;
+    pro)     echo "pro" ;;
+    builder)
+      if [ -z "$template" ] || [ "$template" = "null" ]; then
+        print_err "Builder content requires a template. Use --template <name>, or re-activate your key." >&2
+        return 1
+      fi
+      echo "builder-$template" ;;
+    *) print_err "No content shape for SKU: $sku" >&2; return 1 ;;
+  esac
+}
+
+# Download the entitled content tarball from the gateway, verify it, unpack to cache.
+# Test seam: if AGENTFORGE_FETCH_CMD is set it is invoked instead of the network call as
+#   $AGENTFORGE_FETCH_CMD <sku> <template> <shape> <out-tarball>
+# and must print two lines to stdout: the sha256, then the instance_id.
+fetch_content() {
+  local sku="$1" template="${2:-}" shape="$3"
+  local key instance_id tmp sha_expected instance_new
+
+  key=$(license_read_field "license_key")
+  if [ -z "$key" ]; then
+    print_err "No license key on file. Run: ecc activate <your-license-key>"
+    return 1
+  fi
+  instance_id=$(license_read_field "instance_id")
+  mkdir -p "$CACHE_DIR"
+  tmp=$(mktemp)
+
+  if [ -n "${AGENTFORGE_FETCH_CMD:-}" ]; then
+    local out
+    if ! out=$("$AGENTFORGE_FETCH_CMD" "$sku" "$template" "$shape" "$tmp"); then
+      print_err "Content download refused (mock)"
+      rm -f "$tmp"; return 1
+    fi
+    sha_expected=$(printf '%s\n' "$out" | sed -n '1p')
+    instance_new=$(printf '%s\n' "$out" | sed -n '2p')
+  else
+    require_curl_jq_for_fetch || { rm -f "$tmp"; return 1; }
+    local meta http body url
+    meta=$(mktemp)
+    body=$(jq -nc --arg k "$key" --arg n "$(content_instance_name)" --arg i "$instance_id" \
+      '{license_key:$k, instance_name:$n} + (if $i=="" then {} else {instance_id:$i} end)')
+    http=$(curl -s -o "$meta" -w "%{http_code}" --max-time 30 \
+      -X POST "$FETCH_URL" -H "Content-Type: application/json" -d "$body" 2>/dev/null || echo "000")
+    if [ "$http" != "200" ]; then
+      local msg; msg=$(jq -r '.error // .message // empty' "$meta" 2>/dev/null)
+      [ -z "$msg" ] && msg="HTTP $http"
+      print_err "Content download refused: $msg"
+      rm -f "$meta" "$tmp"; return 1
+    fi
+    url=$(jq -r '.download // ""' "$meta")
+    sha_expected=$(jq -r '.sha256 // ""' "$meta")
+    instance_new=$(jq -r '.instance_id // ""' "$meta")
+    rm -f "$meta"
+    if [ -z "$url" ]; then print_err "Gateway returned no download URL"; rm -f "$tmp"; return 1; fi
+    print_info "Downloading $shape content..."
+    if ! curl -fsSL --max-time 180 -o "$tmp" "$url"; then
+      print_err "Download failed"; rm -f "$tmp"; return 1
+    fi
+  fi
+
+  if [ -n "$sha_expected" ] && [ "$sha_expected" != "null" ]; then
+    local sha_actual; sha_actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$sha_actual" != "$sha_expected" ]; then
+      print_err "Checksum mismatch -- refusing to install."
+      print_info "expected $sha_expected"
+      print_info "got      $sha_actual"
+      rm -f "$tmp"; return 1
+    fi
+  fi
+
+  rm -rf "$CONTENT_DIR"
+  mkdir -p "$CONTENT_DIR"
+  if ! tar -xzf "$tmp" -C "$CONTENT_DIR" 2>/dev/null; then
+    print_err "Failed to unpack content archive"
+    rm -rf "$CONTENT_DIR"; rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  printf '%s\n' "$shape" > "$CONTENT_DIR/.shape"
+
+  if [ -n "$instance_new" ] && [ "$instance_new" != "null" ] && [ -f "$LICENSE_FILE" ]; then
+    local lt; lt=$(mktemp)
+    jq --arg id "$instance_new" '.instance_id = $id' "$LICENSE_FILE" > "$lt" && mv "$lt" "$LICENSE_FILE"
+  fi
+  print_ok "Content ready ($shape)"
+}
+
+# Ensure entitled content is available before install/update. No-op for a local
+# checkout or when the right shape is already cached; otherwise fetches it.
+ensure_content() {
+  local sku="$1" template="${2:-}"
+  if have_local_content; then
+    resolve_content_root
+    return 0
+  fi
+  if [ "$sku" = "builder" ] && { [ -z "$template" ] || [ "$template" = "null" ]; }; then
+    template="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
+  fi
+  local want_shape
+  want_shape=$(content_shape "$sku" "$template") || return 1
+  local have_shape=""
+  [ -f "$CONTENT_DIR/.shape" ] && have_shape=$(cat "$CONTENT_DIR/.shape" 2>/dev/null)
+  if [ -d "$CONTENT_DIR/src/skills" ] && [ "$have_shape" = "$want_shape" ]; then
+    resolve_content_root
+    return 0
+  fi
+  fetch_content "$sku" "$template" "$want_shape" || return 1
+  resolve_content_root
+}
+
+# -- Commands --
+cmd_install() {
+  require_jq
+  require_manifest
+  require_content
+  registry_init
+  license_revalidate_if_stale
+
+  local target_sku="" target_template="" target_skill=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sku)
+        shift; target_sku="${1:-}"
+        ;;
+      --template)
+        shift; target_template="${1:-}"
+        ;;
+      -*)
+        print_err "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        target_skill="$1"
+        ;;
+    esac
+    shift
+  done
+
+  # Single skill mode (any SKU can install individual skills they're entitled to)
+  if [ -n "$target_skill" ]; then
+    local skill_sku
+    skill_sku=$(manifest_skill_sku "$target_skill")
+    if [ "$skill_sku" = "unknown" ]; then
+      print_err "Unknown skill: $target_skill"
+      print_info "Run: ecc list --available"
+      exit 1
+    fi
+    local owned_sku
+    owned_sku=$(detect_sku)
+    if ! check_sku_access "$skill_sku" "$owned_sku"; then
+      print_warn "Skill '$target_skill' requires SKU: $skill_sku (you have: $owned_sku)"
+      print_info "Buy at: $(manifest_buy_url)"
+      exit 1
+    fi
+    ensure_content "$owned_sku" || exit 1
+    install_skill "$target_skill" && print_ok "Installed skill: $target_skill"
+    return
+  fi
+
+  # Template mode
+  if [ -n "$target_template" ]; then
+    local owned_sku
+    owned_sku=$(detect_sku)
+    if ! check_sku_access "builder" "$owned_sku"; then
+      print_warn "Templates require Builder or Pro SKU (you have: $owned_sku)"
+      print_info "Buy at: $(manifest_buy_url)"
+      exit 1
+    fi
+    ensure_content "$owned_sku" "$target_template" || exit 1
+    install_template "$target_template"
+    return
+  fi
+
+  # SKU mode: install effective set
+  if [ -z "$target_sku" ]; then
+    target_sku=$(detect_sku)
+  fi
+
+  if ! jq -e ".skus.\"${target_sku}\"" "$MANIFEST" &>/dev/null; then
+    print_err "Unknown SKU: $target_sku (valid: starter, builder, pro)"
+    exit 1
+  fi
+
+  local owned_sku
+  owned_sku=$(license_effective_sku)
+  if ! check_sku_access "$target_sku" "$owned_sku"; then
+    print_warn "SKU '$target_sku' requires a license; you currently have '$owned_sku'"
+    print_info "Activate with: ecc activate <your-license-key>"
+    print_info "Buy at: $(manifest_buy_url)"
+    print_info "Falling back to '$owned_sku'..."
+    target_sku="$owned_sku"
+  fi
+
+  # Fetch entitled content if a local checkout doesn't already supply it.
+  ensure_content "$target_sku" || exit 1
+
+  print_header "AgentForge ECC Installer"
+  print_info "SKU: $target_sku"
+
+  local skills_list agents_list installed=0 errors=0
+  mapfile -t skills_list < <(manifest_sku_effective_skills "$target_sku")
+  mapfile -t agents_list < <(manifest_sku_effective_agents "$target_sku")
+
+  local total=$(( ${#skills_list[@]} + ${#agents_list[@]} ))
+  local current=0
+
+  for skill in "${skills_list[@]}"; do
+    [ -z "$skill" ] && continue
+    current=$((current + 1))
+    if install_skill "$skill" 2>/dev/null; then
+      print_step "$current" "$total" "skill: $skill"
+      installed=$((installed + 1))
+    else
+      print_err "Failed: skill $skill"
+      errors=$((errors + 1))
+    fi
+  done
+
+  for agent in "${agents_list[@]}"; do
+    [ -z "$agent" ] && continue
+    current=$((current + 1))
+    if install_agent "$agent" 2>/dev/null; then
+      print_step "$current" "$total" "agent: $agent"
+      installed=$((installed + 1))
+    else
+      print_err "Failed: agent $agent"
+      errors=$((errors + 1))
+    fi
+  done
+
+  install_rules_all
+
+  # Builder: install one chosen template.
+  # Precedence: AGENTFORGE_TEMPLATE env > license-derived template > interactive hint.
+  if [ "$target_sku" = "builder" ]; then
+    local chosen_template="${AGENTFORGE_TEMPLATE:-}"
+    if [ -z "$chosen_template" ]; then
+      chosen_template=$(license_read_field "template")
+    fi
+    if [ -n "$chosen_template" ] && [ "$chosen_template" != "null" ]; then
+      print_info "Installing your selected Builder template: $chosen_template"
+      install_template "$chosen_template"
+    else
+      print_header "Builder Template Selection"
+      print_info "Builder SKU includes one template. Choose one:"
+      for tmpl in $(manifest_template_names); do
+        local label status
+        label=$(manifest_template_label "$tmpl")
+        status=$(manifest_template_status "$tmpl")
+        print_info "  ecc install --template $tmpl     [$status]  $label"
+      done
+    fi
+  fi
+
+  # Pro: install all templates + security hardening
+  if [ "$target_sku" = "pro" ]; then
+    print_header "Pro Templates"
+    for tmpl in $(manifest_template_names); do
+      install_template "$tmpl" || true
+    done
+    if [ "$(jq -r '.skus.pro.features.security_hardening' "$MANIFEST")" = "true" ]; then
+      install_security_hardening
+    fi
+  fi
+
+  registry_save_meta "$target_sku"
+
+  print_header "Install Summary"
+  print_ok "Installed: $installed items (SKU: $target_sku)"
+  if [ "$errors" -gt 0 ]; then
+    print_err "Errors: $errors items"
+  fi
+}
+
+derive_sku_from_product() {
+  local product_name="${1,,}" variant_name="${2,,}"
+  local combined="$product_name $variant_name"
+  if [[ "$combined" == *"pro"* ]]; then echo "pro"
+  elif [[ "$combined" == *"builder"* ]]; then echo "builder"
+  elif [[ "$combined" == *"starter"* ]]; then echo "starter"
+  else echo "starter"; fi
+}
+
+# Map a LemonSqueezy variant name to a Builder template choice.
+# Builder buyers pick 1 of 4 templates; the choice rides on the variant name.
+# Order matters: prediction-markets is checked before trading so its "market"
+# substring does not get swallowed by the trading branch. Returns "" if no match.
+derive_template_from_variant() {
+  local v="${1,,}"
+  case "$v" in
+    *prediction*|*polymarket*|*kalshi*|*manifold*) echo "prediction-markets" ;;
+    *influencer*|*content*|*studio*)               echo "ai-influencer" ;;
+    *saas*|*indie*|*startup*)                       echo "indie-saas" ;;
+    *trading*|*financial*|*market*|*quant*)         echo "trading" ;;
+    *) echo "" ;;
+  esac
+}
+
+license_validate_api() {
+  local key="$1"
+
+  if ! command -v curl &>/dev/null; then
+    print_err "curl is required for license activation"
+    exit 1
+  fi
+
+  local response http_code
+  response=$(mktemp)
+  # LemonSqueezy License API expects form-encoded data and is keyed by the license_key
+  # itself (no Authorization header). --data-urlencode safely encodes the key.
+  http_code=$(curl -s -o "$response" -w "%{http_code}" \
+    --max-time 10 \
+    -X POST "https://api.lemonsqueezy.com/v1/licenses/validate" \
+    -H "Accept: application/json" \
+    --data-urlencode "license_key=$key" \
+    --data-urlencode "instance_name=ecc-cli" 2>/dev/null || echo "000")
+
+  if [ "$http_code" = "000" ]; then
+    print_err "Network error -- could not reach license server"
+    print_info "Check your internet connection and try again"
+    rm -f "$response"
+    return 1
+  fi
+
+  if [ "$http_code" != "200" ]; then
+    local err_msg
+    err_msg=$(jq -r '.error // .message // "Unknown error"' "$response" 2>/dev/null || echo "HTTP $http_code")
+    print_err "License validation failed: $err_msg"
+    rm -f "$response"
+    return 1
+  fi
+
+  local valid
+  valid=$(jq -r '.valid // false' "$response" 2>/dev/null)
+  _LS_STATUS=$(jq -r '.license_key.status // "unknown"' "$response" 2>/dev/null)
+  _LS_EMAIL=$(jq -r '.meta.customer_email // "unknown"' "$response" 2>/dev/null)
+
+  local product_name variant_name
+  product_name=$(jq -r '.meta.product_name // ""' "$response" 2>/dev/null)
+  variant_name=$(jq -r '.meta.variant_name // ""' "$response" 2>/dev/null)
+
+  _LS_SKU=$(derive_sku_from_product "$product_name" "$variant_name")
+
+  # Builder buyers pick one template; resolve it from the variant name.
+  _LS_TEMPLATE=""
+  if [ "$_LS_SKU" = "builder" ]; then
+    _LS_TEMPLATE=$(derive_template_from_variant "$variant_name")
+  fi
+
+  rm -f "$response"
+
+  # A freshly issued key is "inactive" until its first activation (performed by
+  # the gateway during content fetch). Accept inactive; reject only invalid or
+  # terminal-bad statuses.
+  if [ "$valid" != "true" ] || [ "$_LS_STATUS" = "expired" ] || [ "$_LS_STATUS" = "disabled" ]; then
+    print_err "License is not valid (status: $_LS_STATUS)"
+    return 1
+  fi
+  return 0
+}
+
+license_revalidate_if_stale() {
+  if [ ! -f "$LICENSE_FILE" ]; then return 0; fi
+  local validated_at days_ago
+  validated_at=$(jq -r '.validated_at // ""' "$LICENSE_FILE" 2>/dev/null)
+  if [ -z "$validated_at" ] || [ "$validated_at" = "null" ]; then return 0; fi
+  days_ago=$(( ($(date +%s) - $(date -d "$validated_at" +%s 2>/dev/null || echo 0)) / 86400 ))
+  if [ "$days_ago" -gt 30 ]; then
+    print_info "Re-validating license (last checked ${days_ago} days ago)..."
+    local key
+    key=$(jq -r '.license_key // ""' "$LICENSE_FILE" 2>/dev/null)
+    if [ -z "$key" ]; then return 0; fi
+    if license_validate_api "$key"; then
+      local tmp_license
+      tmp_license=$(mktemp)
+      jq --arg sku "$_LS_SKU" --arg email "$_LS_EMAIL" --arg tmpl "${_LS_TEMPLATE:-}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.sku = $sku | .customer_email = $email | .validated_at = $ts | (if $tmpl != "" then .template = $tmpl else . end)' "$LICENSE_FILE" > "$tmp_license" \
+        && mv "$tmp_license" "$LICENSE_FILE"
+      print_ok "License still active"
+    else
+      print_warn "License validation failed -- falling back to Starter"
+      print_info "Re-activate with: ecc activate <key>"
+    fi
+  fi
+}
+
+cmd_activate() {
+  require_jq
+  require_manifest
+  registry_init
+
+  local key=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) print_err "Unknown flag: $1"; exit 1 ;;
+      *) key="$1" ;;
+    esac
+    shift
+  done
+
+  if [ -z "$key" ]; then
+    print_err "Usage: ecc activate <license-key>"
+    exit 1
+  fi
+
+  key="${key// /}"
+  key="${key//$'\n'/}"
+
+  if [ ${#key} -lt 10 ]; then
+    print_err "Invalid license key format"
+    exit 1
+  fi
+
+  print_info "Validating license key..."
+
+  if ! license_validate_api "$key"; then
+    exit 1
+  fi
+
+  # Activation date anchors the 12-month updates window. Preserve the original
+  # date across re-activations so renewing a key does not reset the clock.
+  local activated_at prev_instance=""
+  activated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ -f "$LICENSE_FILE" ]; then
+    local prev_activated
+    prev_activated=$(jq -r '.activated_at // empty' "$LICENSE_FILE" 2>/dev/null)
+    [ -n "$prev_activated" ] && activated_at="$prev_activated"
+    prev_instance=$(jq -r '.instance_id // empty' "$LICENSE_FILE" 2>/dev/null)
+  fi
+
+  cat > "$LICENSE_FILE" << ENDJSON
+{
+  "license_key": "$key",
+  "status": "active",
+  "sku": "$_LS_SKU",
+  "template": "${_LS_TEMPLATE:-}",
+  "instance_id": "$prev_instance",
+  "expires_at": null,
+  "customer_email": "$_LS_EMAIL",
+  "activated_at": "$activated_at",
+  "validated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+ENDJSON
+
+  print_ok "License activated successfully"
+  print_info "Email: $_LS_EMAIL"
+  print_info "SKU:   $_LS_SKU"
+  if [ -n "${_LS_TEMPLATE:-}" ]; then
+    print_info "Template: $_LS_TEMPLATE"
+  fi
+
+  echo ""
+  print_info "Installing $_LS_SKU content..."
+  cmd_install --sku "$_LS_SKU"
+}
+
+# Echo "<expiry-date> <days-left>" for <activated-date> + <months>.
+# Returns non-zero if the date math fails (non-GNU date, bad input).
+updates_window() {
+  local activated_date="${1:0:10}" months="$2"
+  local expiry exp_epoch now_epoch days
+  expiry=$(date -d "$activated_date +${months} months" +%Y-%m-%d 2>/dev/null) || return 1
+  exp_epoch=$(date -d "$expiry" +%s 2>/dev/null) || return 1
+  now_epoch=$(date +%s)
+  days=$(( (exp_epoch - now_epoch) / 86400 ))
+  printf '%s %s\n' "$expiry" "$days"
+}
+
+# Render the license-detail view (ecc status --license): SKU, dates, the
+# 12-month free-updates window, and -- for Pro -- IOC patch currency.
+show_license_detail() {
+  require_manifest
+  echo ""
+  echo "${BOLD}AgentForge License${RESET}"
+  echo "$(printf '%.0s-' {1..40})"
+
+  if [ ! -f "$LICENSE_FILE" ]; then
+    local fb
+    fb=$(jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST" 2>/dev/null)
+    print_warn "No license on file -- running '$fb' fallback."
+    print_info "Buy at: $(manifest_buy_url)"
+    print_info "Activate with: ecc activate <your-license-key>"
+    echo ""
+    return
+  fi
+
+  local status sku tmpl email activated
+  status=$(license_read_field "status")
+  sku=$(license_read_field "sku")
+  tmpl=$(license_read_field "template")
+  email=$(license_read_field "customer_email")
+  activated=$(license_read_field "activated_at")
+  [ -z "$activated" ] && activated=$(license_read_field "validated_at")
+
+  echo "SKU:          ${sku:-unknown} (one-time, lifetime ownership)"
+  echo "Status:       ${status:-unknown}"
+  [ -n "$email" ] && [ "$email" != "null" ] && echo "Customer:     $email"
+  [ -n "$tmpl" ]  && [ "$tmpl" != "null" ]  && echo "Template:     $tmpl"
+  [ -n "$activated" ] && [ "$activated" != "null" ] && echo "Activated:    ${activated:0:10}"
+  echo "$(printf '%.0s-' {1..40})"
+
+  local months win exp days
+  months=$(jq -r ".skus.\"${sku}\".features.free_updates_months // 12" "$MANIFEST" 2>/dev/null)
+  echo "Free updates: included for ${months} months"
+  if [ -n "$activated" ] && [ "$activated" != "null" ] && win=$(updates_window "$activated" "$months"); then
+    exp=${win%% *}; days=${win##* }
+    if [ "$days" -ge 0 ]; then
+      echo "              expires $exp ($days days left)"
+    else
+      echo "              ${YELLOW}expired $exp ($(( -days )) days ago)${RESET}"
+    fi
+  fi
+
+  if [ "$sku" = "pro" ]; then
+    echo "$(printf '%.0s-' {1..40})"
+    local ioc_months ioc_at iwin iexp idays
+    ioc_months=$(jq -r '.skus.pro.features.ioc_patch_delivery_months // 12' "$MANIFEST" 2>/dev/null)
+    ioc_at=$(jq -r '.ioc_updated_at // empty' "$REGISTRY_FILE" 2>/dev/null)
+    echo "IOC patches:  Pro delivery included for ${ioc_months} months"
+    if [ -n "$ioc_at" ]; then
+      echo "              current as of ${ioc_at:0:10}"
+    else
+      echo "              not yet applied -- run: ecc security --install"
+    fi
+    if [ -n "$activated" ] && [ "$activated" != "null" ] && iwin=$(updates_window "$activated" "$ioc_months"); then
+      iexp=${iwin%% *}; idays=${iwin##* }
+      [ "$idays" -ge 0 ] && echo "              support expires $iexp ($idays days left)"
+    fi
+  fi
+  echo "$(printf '%.0s-' {1..40})"
+  echo ""
+}
+
+cmd_status() {
+  require_jq
+  registry_init
+  resolve_content_root
+
+  local show_license=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --license|-l) show_license=true ;;
+      *) print_err "Unknown flag: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  if $show_license; then
+    show_license_detail
+    return
+  fi
+
+  local sku installed_skills installed_agents installed_templates
+  sku=$(detect_sku)
+  installed_skills=$(registry_list "skills" | wc -l)
+  installed_agents=$(registry_list "agents" | wc -l)
+  installed_templates=$(registry_list "templates" | wc -l)
+
+  local license_info="No license -- $(jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST") fallback"
+  if [ -f "$LICENSE_FILE" ]; then
+    local status owned
+    status=$(license_read_field "status")
+    owned=$(license_read_field "sku")
+    if [ "$status" = "active" ]; then
+      license_info="$owned (one-time, lifetime)"
+    else
+      license_info="Inactive -- run: ecc activate <key>"
+    fi
+  fi
+
+  if [ -n "${AGENTFORGE_SKU:-}" ]; then
+    license_info="$license_info ${DIM}(env override: AGENTFORGE_SKU=$AGENTFORGE_SKU)${RESET}"
+  fi
+
+  echo ""
+  echo "${BOLD}AgentForge ECC${RESET}  v$ECC_VERSION"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "License:   $license_info"
+  echo "Active SKU: $sku"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "Installed: $installed_skills skills, $installed_agents agents, $installed_templates templates"
+  echo "Source:    $SRC_DIR"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "Run ${BOLD}ecc doctor${RESET} to check installation health."
+  echo ""
+}
+
+cmd_list() {
+  require_jq
+  require_manifest
+  registry_init
+
+  local show_available=false filter_sku=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --available) show_available=true ;;
+      --installed) show_available=false ;;
+      --sku) shift; filter_sku="${1:-}" ;;
+      *) print_err "Unknown flag: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  local owned_sku
+  owned_sku=$(detect_sku)
+
+  badge_for_sku() {
+    local sku="$1" accessible="$2"
+    if [ "$accessible" = "true" ]; then
+      case "$sku" in
+        starter) echo "${GREEN}[STARTER]${RESET}" ;;
+        builder) echo "${BLUE}[BUILDER]${RESET}" ;;
+        pro)     echo "${PURPLE}[PRO]${RESET}    " ;;
+        *)       echo "${DIM}[?]${RESET}      " ;;
+      esac
+    else
+      echo "${DIM}[LOCKED] ${RESET}"
+    fi
+  }
+
+  if $show_available; then
+    print_header "Available Skills"
+    for sku in starter builder pro; do
+      [ -n "$filter_sku" ] && [ "$filter_sku" != "$sku" ] && continue
+      local accessible="false"
+      check_sku_access "$sku" "$owned_sku" && accessible="true"
+      manifest_sku_delta_skills "$sku" | sort | while read -r skill; do
+        [ -z "$skill" ] && continue
+        echo "  $(badge_for_sku "$sku" "$accessible") $skill"
+      done
+    done
+
+    print_header "Available Agents"
+    for sku in starter builder pro; do
+      [ -n "$filter_sku" ] && [ "$filter_sku" != "$sku" ] && continue
+      local accessible="false"
+      check_sku_access "$sku" "$owned_sku" && accessible="true"
+      manifest_sku_delta_agents "$sku" | sort | while read -r agent; do
+        [ -z "$agent" ] && continue
+        echo "  $(badge_for_sku "$sku" "$accessible") $agent"
+      done
+    done
+
+    print_header "Available Templates"
+    for tmpl in $(manifest_template_names); do
+      local label status
+      label=$(manifest_template_label "$tmpl")
+      status=$(manifest_template_status "$tmpl")
+      local color="$DIM"
+      case "$status" in
+        ready) color="$GREEN" ;;
+        in-development) color="$YELLOW" ;;
+        planned) color="$DIM" ;;
+      esac
+      echo "  ${color}[${status}]${RESET}  $tmpl -- $label"
+    done
+  else
+    print_header "Installed Skills"
+    registry_list "skills" | sort | while read -r skill; do
+      [ -z "$skill" ] && continue
+      local sku
+      sku=$(manifest_skill_sku "$skill")
+      echo "  $(badge_for_sku "$sku" "true") $skill"
+    done
+
+    print_header "Installed Agents"
+    registry_list "agents" | sort | while read -r agent; do
+      [ -z "$agent" ] && continue
+      local sku
+      sku=$(manifest_agent_sku "$agent")
+      echo "  $(badge_for_sku "$sku" "true") $agent"
+    done
+
+    print_header "Installed Templates"
+    registry_list "templates" | sort | while read -r tmpl; do
+      [ -z "$tmpl" ] && continue
+      echo "  ${PURPLE}[TMPL]${RESET}   $tmpl"
+    done
+  fi
+  echo ""
+}
+
+cmd_doctor() {
+  require_jq
+  registry_init
+  resolve_content_root
+
+  print_header "AgentForge ECC Doctor"
+
+  local pass=0 fail=0
+
+  run_check() {
+    local label="$1"
+    if eval "$2"; then
+      print_ok "$label"
+      pass=$((pass + 1))
+    else
+      print_warn "$label -- $3"
+      fail=$((fail + 1))
+    fi
+  }
+
+  run_check "Claude Code installed" \
+    "command -v claude &>/dev/null" \
+    "Install: npm install -g @anthropic-ai/claude-code"
+
+  run_check "~/.claude/ directory exists" \
+    "[ -d '$CLAUDE_DIR' ]" \
+    "Run: mkdir -p ~/.claude"
+
+  run_check "Skills directory exists" \
+    "[ -d '$CLAUDE_DIR/skills/ecc' ]" \
+    "Run: ecc install"
+
+  run_check "Agents directory exists" \
+    "[ -d '$CLAUDE_DIR/agents' ]" \
+    "Run: ecc install"
+
+  run_check "manifest.json exists" \
+    "[ -f '$MANIFEST' ]" \
+    "Re-clone AgentForge"
+
+  run_check "manifest schema is v2" \
+    "[ \"\$(jq -r '.version' '$MANIFEST' 2>/dev/null)\" = '2.0.0' ]" \
+    "Update: pull latest from origin/main"
+
+  run_check "Content available (local checkout or downloaded)" \
+    "[ -n '$CONTENT_ROOT' ]" \
+    "Download it: ecc activate <your-license-key>"
+
+  run_check "registry.json valid" \
+    "jq empty '$REGISTRY_FILE' 2>/dev/null" \
+    "Reset: rm ~/.ecc/registry.json && ecc install"
+
+  run_check "jq available" \
+    "command -v jq &>/dev/null" \
+    "Install: sudo apt install jq"
+
+  run_check "curl available" \
+    "command -v curl &>/dev/null" \
+    "Install: sudo apt install curl"
+
+  print_header "Results"
+  echo "$pass checks passed, $fail warnings"
+  if [ "$fail" -eq 0 ]; then
+    print_ok "Installation is healthy"
+  else
+    print_warn "Run the suggested fix commands above"
+  fi
+  echo ""
+}
+
+cmd_update() {
+  require_jq
+  require_manifest
+  registry_init
+
+  print_header "AgentForge ECC Update"
+
+  if [ -d "$ECC_DIR/.git" ]; then
+    print_info "Pulling latest CLI + manifest..."
+    if git -C "$ECC_DIR" pull --ff-only 2>&1; then
+      print_ok "Repository updated"
+    else
+      print_warn "Could not pull -- using current version"
+    fi
+  fi
+
+  # Refresh entitled content from the gateway unless a local checkout supplies it.
+  if ! have_local_content; then
+    local up_sku up_tmpl up_shape
+    up_sku=$(detect_sku)
+    up_tmpl=""
+    [ "$up_sku" = "builder" ] && up_tmpl="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
+    if up_shape=$(content_shape "$up_sku" "$up_tmpl" 2>/dev/null); then
+      print_info "Refreshing $up_sku content..."
+      fetch_content "$up_sku" "$up_tmpl" "$up_shape" || print_warn "Content refresh failed -- using cached content"
+    fi
+  fi
+  require_content
+
+  print_info "Re-installing registered items..."
+  local updated=0
+
+  while read -r skill; do
+    [ -z "$skill" ] && continue
+    if [ -d "$SRC_DIR/skills/$skill" ]; then
+      mkdir -p "$CLAUDE_DIR/skills/ecc"
+      cp -r "$SRC_DIR/skills/$skill" "$CLAUDE_DIR/skills/ecc/$skill"
+      updated=$((updated + 1))
+    fi
+  done < <(registry_list "skills")
+
+  while read -r agent; do
+    [ -z "$agent" ] && continue
+    if [ -f "$SRC_DIR/agents/${agent}.md" ]; then
+      mkdir -p "$CLAUDE_DIR/agents"
+      cp "$SRC_DIR/agents/${agent}.md" "$CLAUDE_DIR/agents/${agent}.md"
+      updated=$((updated + 1))
+    fi
+  done < <(registry_list "agents")
+
+  install_rules_all
+
+  print_header "Update Summary"
+  print_ok "Updated $updated items"
+  echo ""
+}
+
+cmd_help() {
+  echo ""
+  echo "${BOLD}AgentForge ECC${RESET} v$ECC_VERSION -- Your AI team. Ready in 60 seconds. Pay once, own it."
+  echo ""
+  echo "Usage: ecc <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  ${BOLD}install${RESET}                    Install your purchased SKU (auto-detected)"
+  echo "  ${BOLD}install${RESET} --sku starter      Install Starter SKU explicitly"
+  echo "  ${BOLD}install${RESET} --sku builder      Install Builder SKU (requires license)"
+  echo "  ${BOLD}install${RESET} --sku pro          Install Pro SKU (requires license)"
+  echo "  ${BOLD}install${RESET} --template NAME    Install a template (Builder: 1, Pro: all)"
+  echo "  ${BOLD}install${RESET} SKILL              Install a single skill by name"
+  echo "  ${BOLD}activate${RESET} KEY               Activate a one-time license (auto-installs SKU)"
+  echo "  ${BOLD}update${RESET}                     Pull latest and re-install"
+  echo "  ${BOLD}list${RESET}                       Show installed skills, agents, templates"
+  echo "  ${BOLD}list${RESET} --available           Show all available content"
+  echo "  ${BOLD}doctor${RESET}                     Check installation health"
+  echo "  ${BOLD}status${RESET}                     Show current SKU and counts"
+  echo "  ${BOLD}status${RESET} --license           Show license detail and 12-month updates window"
+  echo "  ${BOLD}security${RESET}                   Pro-only: install or check cybersecurity hardening"
+  echo "  ${BOLD}security${RESET} --check           Check security install status"
+  echo "  ${BOLD}security${RESET} --install         Install (no sudo, skips C2 blocklist)"
+  echo "  ${BOLD}security${RESET} --full            Install everything including C2 blocklist (needs sudo)"
+  echo "  ${BOLD}help${RESET}                       Show this message"
+  echo ""
+  echo "SKUs (one-time purchase, no subscription):"
+  echo "  ${GREEN}Starter${RESET} \$39   -- WSL + Ubuntu + Claude Code + basic agent/skill set"
+  echo "  ${BLUE}Builder${RESET} \$99   -- Starter + multi-language depth + 1 domain template"
+  echo "  ${PURPLE}Pro${RESET}     \$249  -- Builder + all 4 templates + cybersecurity hardening"
+  echo ""
+  echo "Templates: $(manifest_template_names 2>/dev/null | tr '\n' ', ' | sed 's/,$//')"
+  echo ""
+  echo "Env vars:"
+  echo "  AGENTFORGE_SKU=starter|builder|pro    -- override license-derived SKU"
+  echo "  AGENTFORGE_TEMPLATE=<name>            -- override the Builder template (else license choice is used)"
+  echo ""
+  echo "Get started: ecc install"
+  echo "Buy:         $(manifest_buy_url 2>/dev/null || echo "$DEFAULT_BUY_URL")"
+  echo ""
+}
+
+cmd_security() {
+  require_jq
+  registry_init
+  local owned_sku
+  owned_sku=$(detect_sku)
+  if [ "$owned_sku" != "pro" ]; then
+    print_warn "Cybersecurity hardening is a Pro SKU feature (you have: $owned_sku)"
+    print_info "Buy at: $(manifest_buy_url)"
+    return 1
+  fi
+  local arg="${1:-}"
+  case "$arg" in
+    --full|-f)     install_security_hardening --full ;;
+    --check|-c|"") install_security_hardening --check ;;
+    --install|-i)  install_security_hardening ;;
+    *)
+      print_err "Unknown security flag: $arg"
+      print_info "Usage: ecc security [--check|--install|--full]"
+      return 1
+      ;;
+  esac
+}
+
+# -- Entry point --
+main() {
+  case "${1:-help}" in
+    install)   shift; cmd_install "$@" ;;
+    update)    cmd_update ;;
+    list)      shift; cmd_list "$@" ;;
+    doctor)    shift; cmd_doctor "$@" ;;
+    activate)  shift; cmd_activate "$@" ;;
+    status)    shift; cmd_status "$@" ;;
+    security)  shift; cmd_security "$@" ;;
+    version)   echo "ecc v$ECC_VERSION" ;;
+    help|--help|-h) cmd_help ;;
+    *)         print_err "Unknown command: $1"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
