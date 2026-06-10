@@ -1,0 +1,2175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Optional support log: when ECC_LOG is set (e.g. by the Windows installer), tee
+# all output to that file so a failed run can hand back one file. Opt-in and unset
+# by default, so normal and test runs are unaffected. Best-effort -- the installer's
+# NSIS Details capture remains the authoritative log.
+if [ -n "${ECC_LOG:-}" ] && mkdir -p "$(dirname "$ECC_LOG")" 2>/dev/null; then
+  exec > >(tee -a "$ECC_LOG") 2>&1
+fi
+
+ECC_VERSION="2.3.0"
+ECC_DIR="${ECC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+MANIFEST="$ECC_DIR/manifest.json"
+CLAUDE_DIR="$HOME/.claude"
+ECC_CONFIG="$HOME/.ecc"
+LICENSE_FILE="$ECC_CONFIG/license.json"
+REGISTRY_FILE="$ECC_CONFIG/registry.json"
+CACHE_DIR="$ECC_CONFIG/cache"
+CONTENT_DIR="$CACHE_DIR/content"
+DEFAULT_BUY_URL="https://agentforge.army/buy"
+BOOTSTRAP_REPO="https://github.com/reinraus135-cyber/agentforge-install.git"
+FETCH_URL="${AGENTFORGE_FETCH_URL:-https://agentforge.army/api/fetch}"
+
+# -- Cockpit (Command Deck) path vars --
+AGENTFORGE_DIR="$HOME/.agentforge"
+COCKPIT_HOME="${AGENTFORGE_COCKPIT_HOME:-$AGENTFORGE_DIR/cockpit}"
+COCKPIT_VENV="$COCKPIT_HOME/.venv"
+COCKPIT_TOKEN_FILE="$COCKPIT_HOME/token"
+COCKPIT_PID_FILE="$COCKPIT_HOME/cockpit.pid"
+COCKPIT_LOG="$COCKPIT_HOME/cockpit.log"
+COCKPIT_REQ_MARKER="$COCKPIT_HOME/.venv-reqs.sha256"
+COCKPIT_PORT="${AGENTFORGE_COCKPIT_PORT:-7842}"
+[[ "$COCKPIT_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$COCKPIT_PORT" -le 65535 ] || COCKPIT_PORT=7842
+
+# -- Quant Lab path vars --
+QUANTLAB_HOME="${AGENTFORGE_QUANTLAB_HOME:-$HOME/QuantLab}"
+QUANTLAB_VENV="$QUANTLAB_HOME/.venv"
+QUANTLAB_REQ_MARKER="$QUANTLAB_HOME/.venv-reqs.sha256"
+QUANTLAB_DEPLOY_MANIFEST="$QUANTLAB_HOME/.deployed.sha256"
+
+# Installable content (src/, templates/, scripts/security) lives EITHER in a local
+# checkout (dev / all-in-one private repo -- keeps offline use and tests working) OR in
+# the fetched-and-unpacked cache at $CONTENT_DIR. These are pointed at the resolved root
+# by resolve_content_root() before any install/update primitive runs.
+CONTENT_ROOT="$ECC_DIR"
+SRC_DIR="$ECC_DIR/src"
+TEMPLATES_DIR="$ECC_DIR/templates"
+SECURITY_DIR="$ECC_DIR/scripts/security"
+
+# -- Colors --
+if [ -t 1 ] && command -v tput &>/dev/null; then
+  GREEN=$(tput setaf 2)
+  YELLOW=$(tput setaf 3)
+  RED=$(tput setaf 1)
+  BLUE=$(tput setaf 4)
+  PURPLE=$(tput setaf 5)
+  BOLD=$(tput bold)
+  DIM=$(tput dim)
+  RESET=$(tput sgr0)
+else
+  GREEN="" YELLOW="" RED="" BLUE="" PURPLE="" BOLD="" DIM="" RESET=""
+fi
+
+print_ok()     { echo "${GREEN}[OK]${RESET}   $*"; }
+print_warn()   { echo "${YELLOW}[WARN]${RESET} $*"; }
+print_err()    { echo "${RED}[ERR]${RESET}  $*" >&2; }
+print_info()   { echo "${DIM}[--]${RESET}   $*"; }
+print_header() { echo ""; echo "${BOLD}$*${RESET}"; echo "$(printf '%.0s-' {1..40})"; }
+print_step()   { echo "${BLUE}[$1/$2]${RESET} $3"; }
+
+# -- Dependency checks --
+require_jq() {
+  if ! command -v jq &>/dev/null; then
+    print_err "jq is required but not installed."
+    print_info "Install with: sudo apt install jq"
+    exit 1
+  fi
+}
+
+require_manifest() {
+  if [ ! -f "$MANIFEST" ]; then
+    print_err "manifest.json not found at $MANIFEST"
+    print_info "Re-clone AgentForge: git clone $BOOTSTRAP_REPO ~/AgentForge"
+    exit 1
+  fi
+}
+
+# True when a local content checkout exists (dev / all-in-one repo, tests). When true,
+# no server fetch is needed -- content is read straight from the repo.
+have_local_content() { [ -d "$ECC_DIR/src/skills" ]; }
+
+# Point SRC_DIR / TEMPLATES_DIR / SECURITY_DIR at whichever content root is available:
+# a local checkout if present, else the fetched cache. CONTENT_ROOT is empty when
+# neither exists yet (caller must fetch).
+resolve_content_root() {
+  if have_local_content; then
+    CONTENT_ROOT="$ECC_DIR"
+  elif [ -d "$CONTENT_DIR/src/skills" ]; then
+    CONTENT_ROOT="$CONTENT_DIR"
+  else
+    CONTENT_ROOT=""
+  fi
+  if [ -n "$CONTENT_ROOT" ]; then
+    SRC_DIR="$CONTENT_ROOT/src"
+    TEMPLATES_DIR="$CONTENT_ROOT/templates"
+    SECURITY_DIR="$CONTENT_ROOT/scripts/security"
+  fi
+}
+
+# Gate for commands that need installable content. Satisfied when content is present
+# locally/cached, OR when an active license exists to fetch it with. AgentForge is a
+# paid product: no content without a license.
+require_content() {
+  resolve_content_root
+  [ -n "$CONTENT_ROOT" ] && return 0
+  if [ -f "$LICENSE_FILE" ] && [ "$(license_read_field status)" = "active" ]; then
+    return 0
+  fi
+  print_err "No AgentForge content installed yet."
+  print_info "Activate your license to download it: ecc activate <your-license-key>"
+  print_info "Buy at: $(manifest_buy_url)"
+  exit 1
+}
+
+require_curl_jq_for_fetch() {
+  command -v curl &>/dev/null     || { print_err "curl is required to download content"; return 1; }
+  command -v jq &>/dev/null       || { print_err "jq is required"; return 1; }
+  command -v tar &>/dev/null      || { print_err "tar is required to unpack content"; return 1; }
+  command -v sha256sum &>/dev/null || { print_err "sha256sum is required to verify content"; return 1; }
+  return 0
+}
+
+# -- Manifest helpers (v2 schema: .skus, .templates) --
+
+# resolve_sku_chain "pro" -> "starter\nbuilder\npro" (in include order, transitive)
+resolve_sku_chain() {
+  local sku="$1"
+  local includes
+  includes=$(jq -r ".skus.\"${sku}\".includes_skus[]?" "$MANIFEST" 2>/dev/null)
+  for inc in $includes; do
+    resolve_sku_chain "$inc"
+  done
+  echo "$sku"
+}
+
+# Delta skills declared at one SKU level (not transitive)
+manifest_sku_delta_skills() {
+  jq -r ".skus.\"${1}\".skills[]?" "$MANIFEST" 2>/dev/null
+}
+
+manifest_sku_delta_agents() {
+  jq -r ".skus.\"${1}\".agents[]?" "$MANIFEST" 2>/dev/null
+}
+
+# Effective skills/agents for a SKU (walks includes_skus transitively, dedupes)
+manifest_sku_effective_skills() {
+  resolve_sku_chain "$1" | while read -r s; do
+    [ -z "$s" ] && continue
+    manifest_sku_delta_skills "$s"
+  done | awk '!seen[$0]++'
+}
+
+manifest_sku_effective_agents() {
+  resolve_sku_chain "$1" | while read -r s; do
+    [ -z "$s" ] && continue
+    manifest_sku_delta_agents "$s"
+  done | awk '!seen[$0]++'
+}
+
+# Which SKU declares this skill/agent (lowest in the ladder)
+manifest_skill_sku() {
+  local name="$1"
+  for sku in starter builder pro; do
+    if jq -e ".skus.\"${sku}\".skills | index(\"$name\")" "$MANIFEST" &>/dev/null; then
+      echo "$sku"; return
+    fi
+  done
+  echo "unknown"
+}
+
+manifest_agent_sku() {
+  local name="$1"
+  for sku in starter builder pro; do
+    if jq -e ".skus.\"${sku}\".agents | index(\"$name\")" "$MANIFEST" &>/dev/null; then
+      echo "$sku"; return
+    fi
+  done
+  echo "unknown"
+}
+
+# Templates
+manifest_template_names() {
+  jq -r '.templates | keys[]' "$MANIFEST" 2>/dev/null
+}
+
+manifest_template_status() {
+  jq -r ".templates.\"${1}\".status // \"unknown\"" "$MANIFEST" 2>/dev/null
+}
+
+manifest_template_label() {
+  jq -r ".templates.\"${1}\".label // \"\"" "$MANIFEST" 2>/dev/null
+}
+
+manifest_buy_url() {
+  jq -r ".enforcement.buy_url // \"$DEFAULT_BUY_URL\"" "$MANIFEST" 2>/dev/null
+}
+
+# -- License helpers --
+license_read_field() {
+  if [ -f "$LICENSE_FILE" ]; then
+    jq -r ".$1 // empty" "$LICENSE_FILE" 2>/dev/null
+  fi
+}
+
+license_effective_sku() {
+  if [ ! -f "$LICENSE_FILE" ]; then
+    jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST" 2>/dev/null
+    return
+  fi
+  local status sku
+  status=$(license_read_field "status")
+  sku=$(license_read_field "sku")
+  if [ "$status" != "active" ]; then
+    echo "starter"; return
+  fi
+  echo "${sku:-starter}"
+}
+
+# SKU ladder access check: quantlab > pro > builder > starter
+# check_sku_access "builder" "pro" => 0 (pro entitles builder content)
+# check_sku_access "pro" "starter" => 1 (starter cannot access pro content)
+check_sku_access() {
+  local required="$1" owned="$2"
+  case "$required" in
+    starter) return 0 ;;
+    builder)
+      case "$owned" in builder|pro|quantlab) return 0 ;; *) return 1 ;; esac
+      ;;
+    pro)
+      case "$owned" in pro|quantlab) return 0 ;; *) return 1 ;; esac
+      ;;
+    quantlab)
+      case "$owned" in quantlab) return 0 ;; *) return 1 ;; esac
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detect target SKU: AGENTFORGE_SKU env > license SKU > starter fallback
+detect_sku() {
+  if [ -n "${AGENTFORGE_SKU:-}" ]; then
+    case "$AGENTFORGE_SKU" in
+      starter|builder|pro|quantlab) echo "$AGENTFORGE_SKU"; return ;;
+      *) print_warn "Unknown AGENTFORGE_SKU '$AGENTFORGE_SKU', ignoring" >&2 ;;
+    esac
+  fi
+  license_effective_sku
+}
+
+# -- Registry helpers --
+registry_init() {
+  mkdir -p "$ECC_CONFIG" "$CACHE_DIR"
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    echo '{"ecc_version":"'"$ECC_VERSION"'","sku":"starter","skills":[],"agents":[],"templates":[],"rules":[]}' | jq . > "$REGISTRY_FILE"
+  fi
+}
+
+registry_add() {
+  local field="$1" value="$2"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg v "$value" ".$field += [\$v] | .$field |= unique" "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+registry_save_meta() {
+  local tmp
+  tmp=$(mktemp)
+  jq --arg sku "$1" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '.sku = $sku | .installed_at = $ts | .ecc_version = "'"$ECC_VERSION"'"' \
+    "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+registry_list() {
+  jq -r ".$1[]?" "$REGISTRY_FILE" 2>/dev/null
+}
+
+# -- Install primitives --
+install_skill() {
+  local name="$1"
+  local src="$SRC_DIR/skills/$name"
+  local dst="$CLAUDE_DIR/skills/$name"
+  if [ ! -d "$src" ]; then
+    print_err "Skill source not found: $name"
+    return 1
+  fi
+  mkdir -p "$CLAUDE_DIR/skills"
+  cp -r "$src" "$dst"
+  registry_add "skills" "$name"
+}
+
+install_agent() {
+  local name="$1"
+  local src="$SRC_DIR/agents/${name}.md"
+  local dst="$CLAUDE_DIR/agents/${name}.md"
+  if [ ! -f "$src" ]; then
+    print_err "Agent source not found: $name"
+    return 1
+  fi
+  mkdir -p "$CLAUDE_DIR/agents"
+  cp "$src" "$dst"
+  registry_add "agents" "$name"
+}
+
+install_rules_all() {
+  local src_rules="$SRC_DIR/rules"
+  local dst_rules="$CLAUDE_DIR/rules/ecc"
+  if [ ! -d "$src_rules" ]; then
+    print_warn "Rules source not found"
+    return 0
+  fi
+  mkdir -p "$dst_rules"
+  cp -r "$src_rules"/. "$dst_rules/"
+  local count
+  count=$(find "$dst_rules" -name "*.md" | wc -l)
+  print_ok "Installed $count rule files"
+}
+
+install_template() {
+  local name="$1"
+  if ! jq -e ".templates.\"${name}\"" "$MANIFEST" &>/dev/null; then
+    print_err "Unknown template: $name"
+    print_info "Available: $(manifest_template_names | tr '\n' ', ' | sed 's/,$//')"
+    return 1
+  fi
+  local status label
+  status=$(manifest_template_status "$name")
+  label=$(manifest_template_label "$name")
+  case "$status" in
+    ready)
+      install_template_files "$name" "$label"
+      ;;
+    in-development|planned)
+      print_warn "Template '$label' status: $status. Available in a future release."
+      ;;
+    *)
+      print_warn "Template '$label' has unknown status: $status"
+      ;;
+  esac
+}
+
+install_template_files() {
+  local name="$1" label="$2"
+  local src_dir="$TEMPLATES_DIR/$name"
+  if [ ! -d "$src_dir" ]; then
+    print_err "Template source not found: $src_dir"
+    print_info "Re-clone or re-run installer to restore templates/"
+    return 1
+  fi
+
+  print_header "Installing template: $label"
+
+  # Show disclaimer prominently if present (trading, prediction-markets)
+  if [ -f "$src_dir/DISCLAIMER.md" ]; then
+    print_warn "This template ships with a DISCLAIMER.md. You are responsible for"
+    print_warn "reading and following it. See $CLAUDE_DIR/templates/$name/DISCLAIMER.md"
+  fi
+
+  # 1. Install template-local agents into ~/.claude/agents/
+  local agent_count=0
+  if [ -d "$src_dir/agents" ]; then
+    mkdir -p "$CLAUDE_DIR/agents"
+    local agent_file
+    for agent_file in "$src_dir/agents"/*.md; do
+      [ -f "$agent_file" ] || continue
+      cp "$agent_file" "$CLAUDE_DIR/agents/"
+      local agent_name
+      agent_name=$(basename "$agent_file" .md)
+      registry_add "agents" "$agent_name"
+      agent_count=$((agent_count + 1))
+    done
+  fi
+
+  # 2. Install template-local skills into ~/.claude/skills/<name>/SKILL.md
+  local skill_count=0
+  if [ -d "$src_dir/skills" ]; then
+    local skill_file
+    for skill_file in "$src_dir/skills"/*.md; do
+      [ -f "$skill_file" ] || continue
+      local skill_name skill_dst
+      skill_name=$(basename "$skill_file" .md)
+      skill_dst="$CLAUDE_DIR/skills/$skill_name"
+      mkdir -p "$skill_dst"
+      cp "$skill_file" "$skill_dst/SKILL.md"
+      registry_add "skills" "$skill_name"
+      skill_count=$((skill_count + 1))
+    done
+  fi
+
+  # 3. Copy template metadata (README, WORKFLOW, DISCLAIMER, sample-config, starter-prompt, showcase-prompt)
+  local template_dst="$CLAUDE_DIR/templates/$name"
+  mkdir -p "$template_dst"
+  local meta_file
+  for meta_file in README.md WORKFLOW.md DISCLAIMER.md sample-config.toml starter-prompt.md showcase-prompt.md; do
+    if [ -f "$src_dir/$meta_file" ]; then
+      cp "$src_dir/$meta_file" "$template_dst/"
+    fi
+  done
+
+  # 4. Register the template
+  registry_add "templates" "$name"
+
+  print_ok "Installed template '$label': $agent_count agents, $skill_count skills"
+  print_info "Workflow:       $template_dst/WORKFLOW.md"
+  print_info "Sample config:  $template_dst/sample-config.toml"
+  print_info "Starter prompt: $template_dst/starter-prompt.md"
+  if [ -f "$template_dst/DISCLAIMER.md" ]; then
+    print_info "DISCLAIMER:     $template_dst/DISCLAIMER.md (read before use)"
+  fi
+  if [ -f "$template_dst/showcase-prompt.md" ]; then
+    print_info "Meet the squad: run /showcase in Claude Code for a guided demo"
+  fi
+}
+
+install_security_hardening() {
+  local mode="${1:-}"
+  print_header "Cybersecurity Hardening (Pro)"
+  local installer="$SECURITY_DIR/install-security.sh"
+  if [ ! -x "$installer" ]; then
+    print_err "Security installer not found or not executable: $installer"
+    print_info "Download Pro content first: ecc activate <your-license-key>"
+    return 1
+  fi
+  print_info "Running $installer ${mode:+$mode}"
+  # Tolerate a sub-phase warning: ecc runs `set -e`, so an installer non-zero exit
+  # would otherwise abort the whole activation (skipping content/feature registration).
+  local sec_rc=0
+  if [ "$mode" = "--full" ]; then
+    "$installer" --full || sec_rc=$?
+  elif [ "$mode" = "--check" ]; then
+    "$installer" --check || sec_rc=$?
+  else
+    "$installer" || sec_rc=$?
+  fi
+  if [ "$sec_rc" -ne 0 ]; then
+    print_warn "Security hardening finished with warnings (exit $sec_rc); some optional phases may be skipped."
+  fi
+  # Only an actual install applies IOC patches; --check just reports status.
+  if [ "$mode" != "--check" ]; then
+    registry_add "features" "security_hardening"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.ioc_updated_at = $ts' \
+      "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+  fi
+  print_info "Status anytime: ecc security --check"
+}
+
+# -- Content fetch (gated download) --
+
+# A stable per-machine instance name so re-activations map to the same LS device slot.
+content_instance_name() {
+  echo "ecc-$(hostname 2>/dev/null || echo host)-$(id -un 2>/dev/null || echo user)"
+}
+
+# Map (sku, template) -> the release-asset shape the gateway serves.
+content_shape() {
+  local sku="$1" template="${2:-}"
+  case "$sku" in
+    starter)  echo "starter" ;;
+    pro)      echo "pro" ;;
+    quantlab) echo "quantlab" ;;
+    builder)
+      if [ -z "$template" ] || [ "$template" = "null" ]; then
+        print_err "Builder content requires a template. Use --template <name>, or re-activate your key." >&2
+        return 1
+      fi
+      echo "builder-$template" ;;
+    *) print_err "No content shape for SKU: $sku" >&2; return 1 ;;
+  esac
+}
+
+# Download the entitled content tarball from the gateway, verify it, unpack to cache.
+# Test seam: if AGENTFORGE_FETCH_CMD is set it is invoked instead of the network call as
+#   $AGENTFORGE_FETCH_CMD <sku> <template> <shape> <out-tarball>
+# and must print two lines to stdout: the sha256, then the instance_id.
+fetch_content() {
+  local sku="$1" template="${2:-}" shape="$3"
+  local key instance_id tmp sha_expected instance_new
+
+  key=$(license_read_field "license_key")
+  if [ -z "$key" ]; then
+    print_err "No license key on file. Run: ecc activate <your-license-key>"
+    return 1
+  fi
+  instance_id=$(license_read_field "instance_id")
+  mkdir -p "$CACHE_DIR"
+  tmp=$(mktemp)
+
+  if [ -n "${AGENTFORGE_FETCH_CMD:-}" ]; then
+    local out
+    if ! out=$("$AGENTFORGE_FETCH_CMD" "$sku" "$template" "$shape" "$tmp"); then
+      print_err "Content download refused (mock)"
+      rm -f "$tmp"; return 1
+    fi
+    sha_expected=$(printf '%s\n' "$out" | sed -n '1p')
+    instance_new=$(printf '%s\n' "$out" | sed -n '2p')
+  else
+    require_curl_jq_for_fetch || { rm -f "$tmp"; return 1; }
+    local meta http body url
+    meta=$(mktemp)
+    body=$(jq -nc --arg k "$key" --arg n "$(content_instance_name)" --arg i "$instance_id" \
+      '{license_key:$k, instance_name:$n} + (if $i=="" then {} else {instance_id:$i} end)')
+    http=$(curl -s -o "$meta" -w "%{http_code}" --max-time 30 \
+      -X POST "$FETCH_URL" -H "Content-Type: application/json" -d "$body" 2>/dev/null || echo "000")
+    if [ "$http" != "200" ]; then
+      local msg; msg=$(jq -r '.error // .message // empty' "$meta" 2>/dev/null)
+      [ -z "$msg" ] && msg="HTTP $http"
+      print_err "Content download refused: $msg"
+      if [ "$http" = "403" ] && printf '%s' "$msg" | grep -qi 'activat\|limit\|device'; then
+        print_info "Device limit full. Run 'ecc uninstall' on your old machine to free a slot,"
+        print_info "or deactivate a device in your LemonSqueezy account, then retry."
+      fi
+      rm -f "$meta" "$tmp"; return 1
+    fi
+    url=$(jq -r '.download // ""' "$meta")
+    sha_expected=$(jq -r '.sha256 // ""' "$meta")
+    instance_new=$(jq -r '.instance_id // ""' "$meta")
+    rm -f "$meta"
+    if [ -z "$url" ]; then print_err "Gateway returned no download URL"; rm -f "$tmp"; return 1; fi
+    print_info "Downloading $shape content..."
+    if ! curl -fsSL --max-time 180 -o "$tmp" "$url"; then
+      print_err "Download failed"; rm -f "$tmp"; return 1
+    fi
+  fi
+
+  if [ -n "$sha_expected" ] && [ "$sha_expected" != "null" ]; then
+    local sha_actual; sha_actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$sha_actual" != "$sha_expected" ]; then
+      print_err "Checksum mismatch -- refusing to install."
+      print_info "expected $sha_expected"
+      print_info "got      $sha_actual"
+      rm -f "$tmp"; return 1
+    fi
+  fi
+
+  rm -rf "$CONTENT_DIR"
+  mkdir -p "$CONTENT_DIR"
+  if ! tar -xzf "$tmp" -C "$CONTENT_DIR" 2>/dev/null; then
+    print_err "Failed to unpack content archive"
+    rm -rf "$CONTENT_DIR"; rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  printf '%s\n' "$shape" > "$CONTENT_DIR/.shape"
+
+  if [ -n "$instance_new" ] && [ "$instance_new" != "null" ] && [ -f "$LICENSE_FILE" ]; then
+    local lt; lt=$(mktemp)
+    jq --arg id "$instance_new" '.instance_id = $id' "$LICENSE_FILE" > "$lt" && mv "$lt" "$LICENSE_FILE"
+  fi
+  print_ok "Content ready ($shape)"
+}
+
+# Ensure entitled content is available before install/update. No-op for a local
+# checkout or when the right shape is already cached; otherwise fetches it.
+ensure_content() {
+  local sku="$1" template="${2:-}"
+  if have_local_content; then
+    resolve_content_root
+    return 0
+  fi
+  if [ "$sku" = "builder" ] && { [ -z "$template" ] || [ "$template" = "null" ]; }; then
+    template="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
+  fi
+  local want_shape
+  want_shape=$(content_shape "$sku" "$template") || return 1
+  local have_shape=""
+  [ -f "$CONTENT_DIR/.shape" ] && have_shape=$(cat "$CONTENT_DIR/.shape" 2>/dev/null)
+  if [ -d "$CONTENT_DIR/src/skills" ] && [ "$have_shape" = "$want_shape" ]; then
+    resolve_content_root
+    return 0
+  fi
+  fetch_content "$sku" "$template" "$want_shape" || return 1
+  resolve_content_root
+}
+
+# Clean-slate ECC content before a full-SKU (re)install so the box reflects EXACTLY the
+# entitled tier. Without this, a downgrade or a re-activate over a different tier leaves
+# stale higher-tier skills/agents/templates behind (e.g. Pro->Builder still reading 4
+# templates / 59 agents). Touches only ECC-tracked items + namespaces; never the user's
+# own ~/.claude content, the license, or other ~/.ecc config.
+reconcile_reset_content() {
+  [ -f "$REGISTRY_FILE" ] || return 0
+  local item
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -f "$CLAUDE_DIR/agents/$item.md"
+  done < <(registry_list agents)
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -rf "$CLAUDE_DIR/templates/$item"
+  done < <(registry_list templates)
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -rf "$CLAUDE_DIR/skills/$item"
+  done < <(registry_list skills)
+  rm -rf "$CLAUDE_DIR/skills/ecc" "$CLAUDE_DIR/rules/ecc"
+  local tmp; tmp=$(mktemp)
+  jq '.skills=[] | .agents=[] | .templates=[] | .rules=[]' "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+# Ensure Claude Code's background auto-updater is disabled via settings.json.
+# On a locked-down install the npm global prefix is often root-owned (e.g. a
+# NodeSource /usr Node install), so the auto-updater fails on every launch with
+# "Auto-update failed: no write permission to npm prefix". env.DISABLE_AUTOUPDATER
+# suppresses that for every claude invocation; updates stay managed (ecc update).
+# Idempotent (no-op once set), merges into existing settings, never fatal.
+ensure_claude_env_settings() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local settings="$CLAUDE_DIR/settings.json"
+  [ -d "$CLAUDE_DIR" ] || mkdir -p "$CLAUDE_DIR"
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  if [ "$(jq -r '.env.DISABLE_AUTOUPDATER // empty' "$settings" 2>/dev/null)" = "1" ]; then
+    return 0
+  fi
+  local t; t=$(mktemp)
+  if jq '.env.DISABLE_AUTOUPDATER = "1"' "$settings" > "$t" 2>/dev/null; then
+    mv "$t" "$settings"
+    print_info "Disabled Claude Code auto-updater (updates are managed via 'ecc update')"
+  else
+    rm -f "$t"
+  fi
+}
+
+# -- Commands --
+cmd_install() {
+  require_jq
+  require_manifest
+  require_content
+  registry_init
+  license_revalidate_if_stale
+  ensure_claude_env_settings
+
+  local target_sku="" target_template="" target_skill=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sku)
+        shift; target_sku="${1:-}"
+        ;;
+      --template)
+        shift; target_template="${1:-}"
+        ;;
+      -*)
+        print_err "Unknown flag: $1"
+        exit 1
+        ;;
+      *)
+        target_skill="$1"
+        ;;
+    esac
+    shift
+  done
+
+  # Single skill mode (any SKU can install individual skills they're entitled to)
+  if [ -n "$target_skill" ]; then
+    local skill_sku
+    skill_sku=$(manifest_skill_sku "$target_skill")
+    if [ "$skill_sku" = "unknown" ]; then
+      print_err "Unknown skill: $target_skill"
+      print_info "Run: ecc list --available"
+      exit 1
+    fi
+    local owned_sku
+    owned_sku=$(detect_sku)
+    if ! check_sku_access "$skill_sku" "$owned_sku"; then
+      print_warn "Skill '$target_skill' requires SKU: $skill_sku (you have: $owned_sku)"
+      print_info "Buy at: $(manifest_buy_url)"
+      exit 1
+    fi
+    ensure_content "$owned_sku" || exit 1
+    install_skill "$target_skill" && print_ok "Installed skill: $target_skill"
+    return
+  fi
+
+  # Template mode
+  if [ -n "$target_template" ]; then
+    local owned_sku
+    owned_sku=$(detect_sku)
+    if ! check_sku_access "builder" "$owned_sku"; then
+      print_warn "Templates require Builder or Pro SKU (you have: $owned_sku)"
+      print_info "Buy at: $(manifest_buy_url)"
+      exit 1
+    fi
+    ensure_content "$owned_sku" "$target_template" || exit 1
+    install_template "$target_template"
+    return
+  fi
+
+  # SKU mode: install effective set
+  if [ -z "$target_sku" ]; then
+    target_sku=$(detect_sku)
+  fi
+
+  if ! jq -e ".skus.\"${target_sku}\"" "$MANIFEST" &>/dev/null; then
+    print_err "Unknown SKU: $target_sku (valid: starter, builder, pro, quantlab)"
+    exit 1
+  fi
+
+  local owned_sku
+  owned_sku=$(license_effective_sku)
+  if ! check_sku_access "$target_sku" "$owned_sku"; then
+    print_warn "SKU '$target_sku' requires a license; you currently have '$owned_sku'"
+    print_info "Activate with: ecc activate <your-license-key>"
+    print_info "Buy at: $(manifest_buy_url)"
+    print_info "Falling back to '$owned_sku'..."
+    target_sku="$owned_sku"
+  fi
+
+  # Fetch entitled content if a local checkout doesn't already supply it.
+  ensure_content "$target_sku" || exit 1
+
+  # Reconcile to exactly this tier first: clear any prior ECC content so a downgrade or a
+  # re-activate over a different tier can't leave stale higher-tier skills/agents/templates.
+  reconcile_reset_content
+
+  print_header "AgentForge ECC Installer"
+  print_info "SKU: $target_sku"
+
+  local skills_list agents_list installed=0 errors=0
+  mapfile -t skills_list < <(manifest_sku_effective_skills "$target_sku")
+  mapfile -t agents_list < <(manifest_sku_effective_agents "$target_sku")
+
+  local total=$(( ${#skills_list[@]} + ${#agents_list[@]} ))
+  local current=0
+
+  for skill in "${skills_list[@]}"; do
+    [ -z "$skill" ] && continue
+    current=$((current + 1))
+    if install_skill "$skill" 2>/dev/null; then
+      print_step "$current" "$total" "skill: $skill"
+      installed=$((installed + 1))
+    else
+      print_err "Failed: skill $skill"
+      errors=$((errors + 1))
+    fi
+  done
+
+  for agent in "${agents_list[@]}"; do
+    [ -z "$agent" ] && continue
+    current=$((current + 1))
+    if install_agent "$agent" 2>/dev/null; then
+      print_step "$current" "$total" "agent: $agent"
+      installed=$((installed + 1))
+    else
+      print_err "Failed: agent $agent"
+      errors=$((errors + 1))
+    fi
+  done
+
+  install_rules_all
+
+  # Builder: install one chosen template.
+  # Precedence: AGENTFORGE_TEMPLATE env > license-derived template > interactive hint.
+  if [ "$target_sku" = "builder" ]; then
+    local chosen_template="${AGENTFORGE_TEMPLATE:-}"
+    if [ -z "$chosen_template" ]; then
+      chosen_template=$(license_read_field "template")
+    fi
+    if [ -n "$chosen_template" ] && [ "$chosen_template" != "null" ]; then
+      print_info "Installing your selected Builder template: $chosen_template"
+      install_template "$chosen_template"
+    else
+      print_header "Builder Template Selection"
+      print_info "Builder SKU includes one template. Choose one:"
+      for tmpl in $(manifest_template_names); do
+        local label status
+        label=$(manifest_template_label "$tmpl")
+        status=$(manifest_template_status "$tmpl")
+        print_info "  ecc install --template $tmpl     [$status]  $label"
+      done
+    fi
+  fi
+
+  # Pro and Quant Lab (includes Pro): install all templates + security hardening
+  if [ "$target_sku" = "pro" ] || [ "$target_sku" = "quantlab" ]; then
+    print_header "Pro Templates"
+    for tmpl in $(manifest_template_names); do
+      install_template "$tmpl" || true
+    done
+    if [ "$(jq -r '.skus.pro.features.security_hardening' "$MANIFEST")" = "true" ]; then
+      install_security_hardening
+    fi
+  fi
+
+  # Quant Lab: deploy the workspace + pre-warm its venv
+  if [ "$target_sku" = "quantlab" ]; then
+    print_header "Quant Lab"
+    quantlab_setup || print_warn "Quant Lab setup incomplete -- run: ecc quantlab --setup"
+  fi
+
+  registry_save_meta "$target_sku"
+
+  print_header "Install Summary"
+  print_ok "Installed: $installed items (SKU: $target_sku)"
+  if [ "$errors" -gt 0 ]; then
+    print_err "Errors: $errors items"
+  fi
+}
+
+derive_sku_from_product() {
+  local product_name="${1,,}" variant_name="${2,,}"
+  local combined="$product_name $variant_name"
+  # quantlab FIRST: "Quant Lab" contains neither pro/builder/starter and would
+  # otherwise fall through to the starter default. Match the two-word phrase,
+  # not bare "quant", so a future cheaper product/variant containing "quant"
+  # (e.g. a "Quantitative Finance" Builder template) cannot derive the $499
+  # SKU. The LS product name MUST contain "quant lab". Keep this order
+  # IDENTICAL in site/api/fetch.mjs and scripts/ls-webhook.js (3-way mirror).
+  if [[ "$combined" == *"quant lab"* ]]; then echo "quantlab"
+  elif [[ "$combined" == *"pro"* ]]; then echo "pro"
+  elif [[ "$combined" == *"builder"* ]]; then echo "builder"
+  elif [[ "$combined" == *"starter"* ]]; then echo "starter"
+  else echo "starter"; fi
+}
+
+# Map a LemonSqueezy variant name to a Builder template choice.
+# Builder buyers pick 1 of 4 templates; the choice rides on the variant name.
+# Order matters: prediction-markets is checked before trading so its "market"
+# substring does not get swallowed by the trading branch. Returns "" if no match.
+derive_template_from_variant() {
+  local v="${1,,}"
+  case "$v" in
+    *prediction*|*polymarket*|*kalshi*|*manifold*) echo "prediction-markets" ;;
+    *influencer*|*content*|*studio*)               echo "ai-influencer" ;;
+    *saas*|*indie*|*startup*)                       echo "indie-saas" ;;
+    *trading*|*financial*|*market*|*quant*)         echo "trading" ;;
+    *) echo "" ;;
+  esac
+}
+
+license_validate_api() {
+  local key="$1"
+
+  if ! command -v curl &>/dev/null; then
+    print_err "curl is required for license activation"
+    exit 1
+  fi
+
+  local response http_code
+  response=$(mktemp)
+  # LemonSqueezy License API expects form-encoded data and is keyed by the license_key
+  # itself (no Authorization header). --data-urlencode safely encodes the key.
+  http_code=$(curl -s -o "$response" -w "%{http_code}" \
+    --max-time 10 \
+    -X POST "https://api.lemonsqueezy.com/v1/licenses/validate" \
+    -H "Accept: application/json" \
+    --data-urlencode "license_key=$key" \
+    --data-urlencode "instance_name=ecc-cli" 2>/dev/null || echo "000")
+
+  if [ "$http_code" = "000" ]; then
+    print_err "Network error -- could not reach license server"
+    print_info "Check your internet connection and try again"
+    rm -f "$response"
+    return 1
+  fi
+
+  if [ "$http_code" != "200" ]; then
+    local err_msg
+    err_msg=$(jq -r '.error // .message // "Unknown error"' "$response" 2>/dev/null || echo "HTTP $http_code")
+    print_err "License validation failed: $err_msg"
+    rm -f "$response"
+    return 1
+  fi
+
+  local valid
+  valid=$(jq -r '.valid // false' "$response" 2>/dev/null)
+  _LS_STATUS=$(jq -r '.license_key.status // "unknown"' "$response" 2>/dev/null)
+  _LS_EMAIL=$(jq -r '.meta.customer_email // "unknown"' "$response" 2>/dev/null)
+
+  local product_name variant_name
+  product_name=$(jq -r '.meta.product_name // ""' "$response" 2>/dev/null)
+  variant_name=$(jq -r '.meta.variant_name // ""' "$response" 2>/dev/null)
+
+  _LS_SKU=$(derive_sku_from_product "$product_name" "$variant_name")
+
+  # Builder buyers pick one template; resolve it from the variant name.
+  _LS_TEMPLATE=""
+  if [ "$_LS_SKU" = "builder" ]; then
+    _LS_TEMPLATE=$(derive_template_from_variant "$variant_name")
+  fi
+
+  rm -f "$response"
+
+  # A freshly issued key is "inactive" until its first activation (performed by
+  # the gateway during content fetch). Accept inactive; reject only invalid or
+  # terminal-bad statuses.
+  if [ "$valid" != "true" ] || [ "$_LS_STATUS" = "expired" ] || [ "$_LS_STATUS" = "disabled" ]; then
+    print_err "License is not valid (status: $_LS_STATUS)"
+    return 1
+  fi
+  return 0
+}
+
+# Release this device's LemonSqueezy activation slot. Best-effort -- a failure here
+# must NEVER block uninstall. Mirrors license_validate_api's form-encoded, key-authed
+# call (the License API needs no store key). ECC_LS_CURL is a seam so tests stub the net.
+license_deactivate_api() {
+  [ -f "$LICENSE_FILE" ] || return 0
+  local key iid curl_cmd
+  key=$(license_read_field "license_key")
+  iid=$(license_read_field "instance_id")
+  [ -n "$key" ] && [ -n "$iid" ] || return 0
+  curl_cmd="${ECC_LS_CURL:-curl}"
+  command -v "${curl_cmd%% *}" >/dev/null 2>&1 || return 0
+  "$curl_cmd" -s -o /dev/null --max-time 10 \
+    -X POST "https://api.lemonsqueezy.com/v1/licenses/deactivate" \
+    -H "Accept: application/json" \
+    --data-urlencode "license_key=$key" \
+    --data-urlencode "instance_id=$iid" >/dev/null 2>&1 || true
+}
+
+license_revalidate_if_stale() {
+  if [ ! -f "$LICENSE_FILE" ]; then return 0; fi
+  local validated_at days_ago
+  validated_at=$(jq -r '.validated_at // ""' "$LICENSE_FILE" 2>/dev/null)
+  if [ -z "$validated_at" ] || [ "$validated_at" = "null" ]; then return 0; fi
+  days_ago=$(( ($(date +%s) - $(date -d "$validated_at" +%s 2>/dev/null || echo 0)) / 86400 ))
+  if [ "$days_ago" -gt 30 ]; then
+    print_info "Re-validating license (last checked ${days_ago} days ago)..."
+    local key
+    key=$(jq -r '.license_key // ""' "$LICENSE_FILE" 2>/dev/null)
+    if [ -z "$key" ]; then return 0; fi
+    if license_validate_api "$key"; then
+      local tmp_license
+      tmp_license=$(mktemp)
+      jq --arg sku "$_LS_SKU" --arg email "$_LS_EMAIL" --arg tmpl "${_LS_TEMPLATE:-}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.sku = $sku | .customer_email = $email | .validated_at = $ts | (if $tmpl != "" then .template = $tmpl else . end)' "$LICENSE_FILE" > "$tmp_license" \
+        && mv "$tmp_license" "$LICENSE_FILE"
+      print_ok "License still active"
+    else
+      print_warn "License validation failed -- falling back to Starter"
+      print_info "Re-activate with: ecc activate <key>"
+    fi
+  fi
+}
+
+cmd_activate() {
+  require_jq
+  require_manifest
+  registry_init
+
+  local key=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -*) print_err "Unknown flag: $1"; exit 1 ;;
+      *) key="$1" ;;
+    esac
+    shift
+  done
+
+  if [ -z "$key" ]; then
+    print_err "Usage: ecc activate <license-key>"
+    exit 1
+  fi
+
+  key="${key// /}"
+  key="${key//$'\n'/}"
+
+  if [ ${#key} -lt 10 ]; then
+    print_err "Invalid license key format"
+    exit 1
+  fi
+
+  print_info "Validating license key..."
+
+  if ! license_validate_api "$key"; then
+    exit 1
+  fi
+
+  # Activation date anchors the 12-month updates window. Preserve the original
+  # date across re-activations so renewing a key does not reset the clock.
+  local activated_at prev_instance=""
+  activated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ -f "$LICENSE_FILE" ]; then
+    local prev_activated
+    prev_activated=$(jq -r '.activated_at // empty' "$LICENSE_FILE" 2>/dev/null)
+    [ -n "$prev_activated" ] && activated_at="$prev_activated"
+    prev_instance=$(jq -r '.instance_id // empty' "$LICENSE_FILE" 2>/dev/null)
+  fi
+
+  cat > "$LICENSE_FILE" << ENDJSON
+{
+  "license_key": "$key",
+  "status": "active",
+  "sku": "$_LS_SKU",
+  "template": "${_LS_TEMPLATE:-}",
+  "instance_id": "$prev_instance",
+  "expires_at": null,
+  "customer_email": "$_LS_EMAIL",
+  "activated_at": "$activated_at",
+  "validated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+ENDJSON
+
+  print_ok "License activated successfully"
+  print_info "Email: $_LS_EMAIL"
+  print_info "SKU:   $_LS_SKU"
+  if [ -n "${_LS_TEMPLATE:-}" ]; then
+    print_info "Template: $_LS_TEMPLATE"
+  fi
+
+  echo ""
+  print_info "Installing $_LS_SKU content..."
+  cmd_install --sku "$_LS_SKU"
+}
+
+# Echo "<expiry-date> <days-left>" for <activated-date> + <months>.
+# Returns non-zero if the date math fails (non-GNU date, bad input).
+updates_window() {
+  local activated_date="${1:0:10}" months="$2"
+  local expiry exp_epoch now_epoch days
+  expiry=$(date -d "$activated_date +${months} months" +%Y-%m-%d 2>/dev/null) || return 1
+  exp_epoch=$(date -d "$expiry" +%s 2>/dev/null) || return 1
+  now_epoch=$(date +%s)
+  days=$(( (exp_epoch - now_epoch) / 86400 ))
+  printf '%s %s\n' "$expiry" "$days"
+}
+
+# Render the license-detail view (ecc status --license): SKU, dates, the
+# 12-month free-updates window, and -- for Pro -- IOC patch currency.
+show_license_detail() {
+  require_manifest
+  echo ""
+  echo "${BOLD}AgentForge License${RESET}"
+  echo "$(printf '%.0s-' {1..40})"
+
+  if [ ! -f "$LICENSE_FILE" ]; then
+    local fb
+    fb=$(jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST" 2>/dev/null)
+    print_warn "No license on file -- running '$fb' fallback."
+    print_info "Buy at: $(manifest_buy_url)"
+    print_info "Activate with: ecc activate <your-license-key>"
+    echo ""
+    return
+  fi
+
+  local status sku tmpl email activated
+  status=$(license_read_field "status")
+  sku=$(license_read_field "sku")
+  tmpl=$(license_read_field "template")
+  email=$(license_read_field "customer_email")
+  activated=$(license_read_field "activated_at")
+  [ -z "$activated" ] && activated=$(license_read_field "validated_at")
+
+  echo "SKU:          ${sku:-unknown} (one-time, lifetime ownership)"
+  echo "Status:       ${status:-unknown}"
+  [ -n "$email" ] && [ "$email" != "null" ] && echo "Customer:     $email"
+  [ -n "$tmpl" ]  && [ "$tmpl" != "null" ]  && echo "Template:     $tmpl"
+  [ -n "$activated" ] && [ "$activated" != "null" ] && echo "Activated:    ${activated:0:10}"
+  echo "$(printf '%.0s-' {1..40})"
+
+  local months win exp days
+  months=$(jq -r ".skus.\"${sku}\".features.free_updates_months // 12" "$MANIFEST" 2>/dev/null)
+  echo "Free updates: included for ${months} months"
+  if [ -n "$activated" ] && [ "$activated" != "null" ] && win=$(updates_window "$activated" "$months"); then
+    exp=${win%% *}; days=${win##* }
+    if [ "$days" -ge 0 ]; then
+      echo "              expires $exp ($days days left)"
+    else
+      echo "              ${YELLOW}expired $exp ($(( -days )) days ago)${RESET}"
+    fi
+  fi
+
+  if [ "$sku" = "pro" ]; then
+    echo "$(printf '%.0s-' {1..40})"
+    local ioc_months ioc_at iwin iexp idays
+    ioc_months=$(jq -r '.skus.pro.features.ioc_patch_delivery_months // 12' "$MANIFEST" 2>/dev/null)
+    ioc_at=$(jq -r '.ioc_updated_at // empty' "$REGISTRY_FILE" 2>/dev/null)
+    echo "IOC patches:  Pro delivery included for ${ioc_months} months"
+    if [ -n "$ioc_at" ]; then
+      echo "              current as of ${ioc_at:0:10}"
+    else
+      echo "              not yet applied -- run: ecc security --install"
+    fi
+    if [ -n "$activated" ] && [ "$activated" != "null" ] && iwin=$(updates_window "$activated" "$ioc_months"); then
+      iexp=${iwin%% *}; idays=${iwin##* }
+      [ "$idays" -ge 0 ] && echo "              support expires $iexp ($idays days left)"
+    fi
+  fi
+  echo "$(printf '%.0s-' {1..40})"
+  echo ""
+}
+
+cmd_status() {
+  require_jq
+  registry_init
+  resolve_content_root
+
+  local show_license=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --license|-l) show_license=true ;;
+      *) print_err "Unknown flag: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  if $show_license; then
+    show_license_detail
+    return
+  fi
+
+  local sku installed_skills installed_agents installed_templates
+  sku=$(detect_sku)
+  installed_skills=$(registry_list "skills" | wc -l)
+  installed_agents=$(registry_list "agents" | wc -l)
+  installed_templates=$(registry_list "templates" | wc -l)
+
+  local license_info="No license -- $(jq -r '.enforcement.fallback_on_offline // "starter"' "$MANIFEST") fallback"
+  if [ -f "$LICENSE_FILE" ]; then
+    local status owned
+    status=$(license_read_field "status")
+    owned=$(license_read_field "sku")
+    if [ "$status" = "active" ]; then
+      license_info="$owned (one-time, lifetime)"
+    else
+      license_info="Inactive -- run: ecc activate <key>"
+    fi
+  fi
+
+  if [ -n "${AGENTFORGE_SKU:-}" ]; then
+    license_info="$license_info ${DIM}(env override: AGENTFORGE_SKU=$AGENTFORGE_SKU)${RESET}"
+  fi
+
+  echo ""
+  echo "${BOLD}AgentForge ECC${RESET}  v$ECC_VERSION"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "License:   $license_info"
+  echo "Active SKU: $sku"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "Installed: $installed_skills skills, $installed_agents agents, $installed_templates templates"
+  echo "Source:    $SRC_DIR"
+  echo "$(printf '%.0s-' {1..40})"
+  echo "Run ${BOLD}ecc doctor${RESET} to check installation health."
+  echo ""
+}
+
+cmd_list() {
+  require_jq
+  require_manifest
+  registry_init
+
+  local show_available=false filter_sku=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --available) show_available=true ;;
+      --installed) show_available=false ;;
+      --sku) shift; filter_sku="${1:-}" ;;
+      *) print_err "Unknown flag: $1"; exit 1 ;;
+    esac
+    shift
+  done
+
+  local owned_sku
+  owned_sku=$(detect_sku)
+
+  badge_for_sku() {
+    local sku="$1" accessible="$2"
+    if [ "$accessible" = "true" ]; then
+      case "$sku" in
+        starter) echo "${GREEN}[STARTER]${RESET}" ;;
+        builder) echo "${BLUE}[BUILDER]${RESET}" ;;
+        pro)     echo "${PURPLE}[PRO]${RESET}    " ;;
+        *)       echo "${DIM}[?]${RESET}      " ;;
+      esac
+    else
+      echo "${DIM}[LOCKED] ${RESET}"
+    fi
+  }
+
+  if $show_available; then
+    print_header "Available Skills"
+    for sku in starter builder pro; do
+      [ -n "$filter_sku" ] && [ "$filter_sku" != "$sku" ] && continue
+      local accessible="false"
+      check_sku_access "$sku" "$owned_sku" && accessible="true"
+      manifest_sku_delta_skills "$sku" | sort | while read -r skill; do
+        [ -z "$skill" ] && continue
+        echo "  $(badge_for_sku "$sku" "$accessible") $skill"
+      done
+    done
+
+    print_header "Available Agents"
+    for sku in starter builder pro; do
+      [ -n "$filter_sku" ] && [ "$filter_sku" != "$sku" ] && continue
+      local accessible="false"
+      check_sku_access "$sku" "$owned_sku" && accessible="true"
+      manifest_sku_delta_agents "$sku" | sort | while read -r agent; do
+        [ -z "$agent" ] && continue
+        echo "  $(badge_for_sku "$sku" "$accessible") $agent"
+      done
+    done
+
+    print_header "Available Templates"
+    for tmpl in $(manifest_template_names); do
+      local label status
+      label=$(manifest_template_label "$tmpl")
+      status=$(manifest_template_status "$tmpl")
+      local color="$DIM"
+      case "$status" in
+        ready) color="$GREEN" ;;
+        in-development) color="$YELLOW" ;;
+        planned) color="$DIM" ;;
+      esac
+      echo "  ${color}[${status}]${RESET}  $tmpl -- $label"
+    done
+  else
+    print_header "Installed Skills"
+    registry_list "skills" | sort | while read -r skill; do
+      [ -z "$skill" ] && continue
+      local sku
+      sku=$(manifest_skill_sku "$skill")
+      echo "  $(badge_for_sku "$sku" "true") $skill"
+    done
+
+    print_header "Installed Agents"
+    registry_list "agents" | sort | while read -r agent; do
+      [ -z "$agent" ] && continue
+      local sku
+      sku=$(manifest_agent_sku "$agent")
+      echo "  $(badge_for_sku "$sku" "true") $agent"
+    done
+
+    print_header "Installed Templates"
+    registry_list "templates" | sort | while read -r tmpl; do
+      [ -z "$tmpl" ] && continue
+      echo "  ${PURPLE}[TMPL]${RESET}   $tmpl"
+    done
+  fi
+  echo ""
+}
+
+cmd_doctor() {
+  require_jq
+  registry_init
+  resolve_content_root
+
+  print_header "AgentForge ECC Doctor"
+
+  local pass=0 fail=0
+
+  run_check() {
+    local label="$1"
+    if eval "$2"; then
+      print_ok "$label"
+      pass=$((pass + 1))
+    else
+      print_warn "$label -- $3"
+      fail=$((fail + 1))
+    fi
+  }
+
+  run_check "Claude Code installed" \
+    "command -v claude &>/dev/null" \
+    "Install: npm install -g @anthropic-ai/claude-code"
+
+  run_check "~/.claude/ directory exists" \
+    "[ -d '$CLAUDE_DIR' ]" \
+    "Run: mkdir -p ~/.claude"
+
+  run_check "Skills installed (flat)" \
+    "find '$CLAUDE_DIR/skills' -maxdepth 2 -name 'SKILL.md' -quit 2>/dev/null | grep -q ." \
+    "Run: ecc install"
+
+  run_check "Agents directory exists" \
+    "[ -d '$CLAUDE_DIR/agents' ]" \
+    "Run: ecc install"
+
+  run_check "manifest.json exists" \
+    "[ -f '$MANIFEST' ]" \
+    "Re-clone AgentForge"
+
+  run_check "manifest schema is v2" \
+    "[ \"\$(jq -r '.version' '$MANIFEST' 2>/dev/null)\" = '2.0.0' ]" \
+    "Update: pull latest from origin/main"
+
+  run_check "Content available (local checkout or downloaded)" \
+    "[ -n '$CONTENT_ROOT' ]" \
+    "Download it: ecc activate <your-license-key>"
+
+  run_check "registry.json valid" \
+    "jq empty '$REGISTRY_FILE' 2>/dev/null" \
+    "Reset: rm ~/.ecc/registry.json && ecc install"
+
+  run_check "jq available" \
+    "command -v jq &>/dev/null" \
+    "Install: sudo apt install jq"
+
+  run_check "curl available" \
+    "command -v curl &>/dev/null" \
+    "Install: sudo apt install curl"
+
+  print_header "Results"
+  echo "$pass checks passed, $fail warnings"
+  if [ "$fail" -eq 0 ]; then
+    print_ok "Installation is healthy"
+  else
+    print_warn "Run the suggested fix commands above"
+  fi
+  echo ""
+}
+
+cmd_update() {
+  require_jq
+  require_manifest
+  registry_init
+
+  print_header "AgentForge ECC Update"
+
+  ensure_claude_env_settings
+
+  if [ -d "$ECC_DIR/.git" ]; then
+    print_info "Pulling latest CLI + manifest..."
+    if git -C "$ECC_DIR" pull --ff-only 2>&1; then
+      print_ok "Repository updated"
+    else
+      print_warn "Could not pull -- using current version"
+    fi
+  fi
+
+  # Refresh entitled content from the gateway unless a local checkout supplies it.
+  if ! have_local_content; then
+    local up_sku up_tmpl up_shape
+    up_sku=$(detect_sku)
+    up_tmpl=""
+    [ "$up_sku" = "builder" ] && up_tmpl="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
+    if up_shape=$(content_shape "$up_sku" "$up_tmpl" 2>/dev/null); then
+      print_info "Refreshing $up_sku content..."
+      fetch_content "$up_sku" "$up_tmpl" "$up_shape" || print_warn "Content refresh failed -- using cached content"
+    fi
+  fi
+  require_content
+
+  print_info "Re-installing registered items..."
+  local updated=0
+
+  while read -r skill; do
+    [ -z "$skill" ] && continue
+    if [ -d "$SRC_DIR/skills/$skill" ]; then
+      mkdir -p "$CLAUDE_DIR/skills"
+      cp -r "$SRC_DIR/skills/$skill" "$CLAUDE_DIR/skills/$skill"
+      updated=$((updated + 1))
+    fi
+  done < <(registry_list "skills")
+
+  while read -r agent; do
+    [ -z "$agent" ] && continue
+    if [ -f "$SRC_DIR/agents/${agent}.md" ]; then
+      mkdir -p "$CLAUDE_DIR/agents"
+      cp "$SRC_DIR/agents/${agent}.md" "$CLAUDE_DIR/agents/${agent}.md"
+      updated=$((updated + 1))
+    fi
+  done < <(registry_list "agents")
+
+  install_rules_all
+
+  print_header "Update Summary"
+  print_ok "Updated $updated items"
+  echo ""
+}
+
+cmd_help() {
+  echo ""
+  echo "${BOLD}AgentForge ECC${RESET} v$ECC_VERSION -- Your AI team. Ready in 60 seconds. Pay once, own it."
+  echo ""
+  echo "Usage: ecc <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  ${BOLD}install${RESET}                    Install your purchased SKU (auto-detected)"
+  echo "  ${BOLD}install${RESET} --sku starter      Install Starter SKU explicitly"
+  echo "  ${BOLD}install${RESET} --sku builder      Install Builder SKU (requires license)"
+  echo "  ${BOLD}install${RESET} --sku pro          Install Pro SKU (requires license)"
+  echo "  ${BOLD}install${RESET} --template NAME    Install a template (Builder: 1, Pro: all)"
+  echo "  ${BOLD}install${RESET} SKILL              Install a single skill by name"
+  echo "  ${BOLD}activate${RESET} KEY               Activate a one-time license (auto-installs SKU)"
+  echo "  ${BOLD}update${RESET}                     Pull latest and re-install"
+  echo "  ${BOLD}list${RESET}                       Show installed skills, agents, templates"
+  echo "  ${BOLD}list${RESET} --available           Show all available content"
+  echo "  ${BOLD}doctor${RESET}                     Check installation health"
+  echo "  ${BOLD}status${RESET}                     Show current SKU and counts"
+  echo "  ${BOLD}status${RESET} --license           Show license detail and 12-month updates window"
+  echo "  ${BOLD}security${RESET}                   Pro-only: install or check cybersecurity hardening"
+  echo "  ${BOLD}security${RESET} --check           Check security install status"
+  echo "  ${BOLD}security${RESET} --install         Install (no sudo, skips C2 blocklist)"
+  echo "  ${BOLD}security${RESET} --full            Install everything including C2 blocklist (needs sudo)"
+  echo "  ${BOLD}cockpit${RESET}                    Open the Command Deck (setup + start + browser)"
+  echo "  ${BOLD}cockpit${RESET} --setup            Pre-warm venv + token (no server, no browser)"
+  echo "  ${BOLD}cockpit${RESET} --stop             Stop the background server"
+  echo "  ${BOLD}cockpit${RESET} --status           Show running/health + port"
+  echo "  ${BOLD}cockpit${RESET} --restart          Stop then relaunch"
+  echo "  ${BOLD}cockpit${RESET} --no-open          Setup + start, skip opening browser"
+  echo "  ${BOLD}cockpit${RESET} --install-hooks    Wire cockpit hooks + statusLine (opt-in, backs up)"
+  echo "  ${BOLD}cockpit${RESET} --uninstall-hooks  Remove statusLine shim (best-effort)"
+  echo "  ${BOLD}quantlab${RESET}                   Quant Lab: deploy workspace to ~/QuantLab + venv"
+  echo "  ${BOLD}quantlab${RESET} --update          Re-deploy after 'ecc update' (keeps your edits)"
+  echo "  ${BOLD}quantlab${RESET} --doctor          Health check + offline smoke backtest"
+  echo "  ${BOLD}uninstall${RESET}                  Remove ECC content (keeps your own ~/.claude + login)"
+  echo "  ${BOLD}uninstall${RESET} --yes            Uninstall without the confirm prompt"
+  echo "  ${BOLD}help${RESET}                       Show this message"
+  echo ""
+  echo "SKUs (one-time purchase, no subscription):"
+  echo "  ${GREEN}Starter${RESET}   \$39   -- WSL + Ubuntu + Claude Code + basic agent/skill set"
+  echo "  ${BLUE}Builder${RESET}   \$99   -- Starter + multi-language depth + 1 domain template"
+  echo "  ${PURPLE}Pro${RESET}       \$249  -- Builder + all 4 templates + cybersecurity hardening"
+  echo "  ${BOLD}Quant Lab${RESET} \$499  -- Pro + the complete algotrading development workspace"
+  echo ""
+  echo "Templates: $(manifest_template_names 2>/dev/null | tr '\n' ', ' | sed 's/,$//')"
+  echo ""
+  echo "Env vars:"
+  echo "  AGENTFORGE_SKU=starter|builder|pro    -- override license-derived SKU"
+  echo "  AGENTFORGE_TEMPLATE=<name>            -- override the Builder template (else license choice is used)"
+  echo ""
+  echo "Get started: ecc install"
+  echo "Buy:         $(manifest_buy_url 2>/dev/null || echo "$DEFAULT_BUY_URL")"
+  echo ""
+}
+
+cmd_security() {
+  require_jq
+  registry_init
+  resolve_content_root   # gated installs ship the scripts in the content cache, not the bootstrap dir
+  local owned_sku
+  owned_sku=$(detect_sku)
+  if ! check_sku_access "pro" "$owned_sku"; then
+    print_warn "Cybersecurity hardening is a Pro SKU feature (you have: $owned_sku)"
+    print_info "Buy at: $(manifest_buy_url)"
+    return 1
+  fi
+  local arg="${1:-}"
+  case "$arg" in
+    --full|-f)     install_security_hardening --full ;;
+    --check|-c|"") install_security_hardening --check ;;
+    --install|-i)  install_security_hardening ;;
+    *)
+      print_err "Unknown security flag: $arg"
+      print_info "Usage: ecc security [--check|--install|--full]"
+      return 1
+      ;;
+  esac
+}
+
+# =============================================================================
+# -- Command Deck (cockpit) --
+# =============================================================================
+
+# Resolve the cockpit source dir from the content root.
+# Prints the path (with trailing backend/shim resolved from it) to stdout,
+# or prints an error and returns 1 if not found.
+cockpit_src_dir() {
+  resolve_content_root
+  local src="${CONTENT_ROOT:-}/cockpit"
+  if [ -f "$src/backend/cockpit/app.py" ]; then
+    echo "$src"
+    return 0
+  fi
+  print_err "Command Deck content not found - run: ecc update (or ecc activate <key>)."
+  return 1
+}
+
+# Health check.  Test seam: ECC_COCKPIT_HEALTH_CMD overrides the real curl.
+cockpit_health() {
+  local cmd="${ECC_COCKPIT_HEALTH_CMD:-curl -fsS -m 2 http://127.0.0.1:$COCKPIT_PORT/api/health}"
+  $cmd >/dev/null 2>&1
+}
+
+# Open browser at URL.  Test seam: ECC_BROWSER_CMD=true to no-op.
+open_browser() {
+  local url="$1"
+  if [ -n "${ECC_BROWSER_CMD:-}" ]; then
+    $ECC_BROWSER_CMD "$url" >/dev/null 2>&1 || true
+    return 0
+  fi
+  if cmd.exe /c start "" "$url" >/dev/null 2>&1; then return 0; fi
+  if wslview "$url" >/dev/null 2>&1; then return 0; fi
+  if powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1; then return 0; fi
+  print_info "Open in your browser: $url"
+}
+
+# True if the file is ccstatusline's bare first-run default (model |
+# context-length | git-branch | git-changes). We may replace THAT with our
+# richer default, but never a config carrying session-cost/context-percentage
+# (the user's own, or one we already installed).
+_ccstatusline_is_default() {
+  [ -f "$1" ] || return 1
+  grep -q '"context-length"' "$1" 2>/dev/null \
+    && grep -q '"git-changes"' "$1" 2>/dev/null \
+    && ! grep -q '"session-cost"' "$1" 2>/dev/null
+}
+
+# Install BOTH ccstatusline configs (idempotent):
+#   - rich personal CLI line (~/.config/ccstatusline/settings.json) so the CLI
+#     shows Model | Ctx | Cost | Total | Session | git instead of the sparse
+#     default -- only on a fresh/bare box, never over a personalized config.
+#   - curated cockpit (Deck) line. Prefer the generator (inherits the user's
+#     element colors); fall back to the shipped static curated config so the Deck
+#     NEVER drops to ccstatusline's default model|ctx|git line.
+# $1 = shim dir, $2 = backend dir.
+cockpit_write_statusline_configs() {
+  local shim_dir="$1" backend_dir="$2"
+  local personal_cfg="$HOME/.config/ccstatusline/settings.json"
+  local cockpit_cfg="$COCKPIT_HOME/ccstatusline.json"
+
+  if [ -f "$shim_dir/ccstatusline-default.json" ] \
+     && { [ ! -f "$personal_cfg" ] || _ccstatusline_is_default "$personal_cfg"; }; then
+    mkdir -p "$(dirname "$personal_cfg")"
+    cp "$shim_dir/ccstatusline-default.json" "$personal_cfg"
+  fi
+
+  if [ "${ECC_COCKPIT_SKIP_VENV:-}" != "1" ] && [ -x "$COCKPIT_VENV/bin/python" ]; then
+    PYTHONPATH="$backend_dir" COCKPIT_HOME="$COCKPIT_HOME" \
+      "$COCKPIT_VENV/bin/python" -m cockpit.shim.gen_statusline_config >/dev/null 2>&1 || true
+  fi
+  if ! grep -q 'Orchestrator' "$cockpit_cfg" 2>/dev/null; then
+    [ -f "$shim_dir/ccstatusline-cockpit.json" ] && cp "$shim_dir/ccstatusline-cockpit.json" "$cockpit_cfg"
+  fi
+}
+
+# Pre-warm the cockpit environment: COCKPIT_HOME dir, token, venv, shims.
+cockpit_setup() {
+  local cockpit_src
+  cockpit_src=$(cockpit_src_dir) || return 1
+  local backend_dir="$cockpit_src/backend"
+  local shim_dir="$cockpit_src/shim"
+
+  # 1. COCKPIT_HOME directory
+  mkdir -p "$COCKPIT_HOME"
+  chmod 700 "$COCKPIT_HOME"
+
+  # 2. Token: create if absent (chmod 600)
+  if [ ! -f "$COCKPIT_TOKEN_FILE" ]; then
+    python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$COCKPIT_TOKEN_FILE"
+    chmod 600 "$COCKPIT_TOKEN_FILE"
+    print_ok "Command Deck: token created"
+  fi
+
+  # 3. Venv: build/rebuild only when requirements.txt sha changes.
+  #    Test seam: ECC_COCKPIT_SKIP_VENV=1 skips venv entirely.
+  if [ "${ECC_COCKPIT_SKIP_VENV:-}" != "1" ]; then
+    local req_file="$backend_dir/requirements.txt"
+    local req_sha=""
+    [ -f "$req_file" ] && req_sha=$(sha256sum "$req_file" | awk '{print $1}')
+    local stored_sha=""
+    [ -f "$COCKPIT_REQ_MARKER" ] && stored_sha=$(cat "$COCKPIT_REQ_MARKER")
+
+    if [ ! -x "$COCKPIT_VENV/bin/python" ] || [ "$req_sha" != "$stored_sha" ]; then
+      print_info "Command Deck: building Python venv..."
+      local venv_cmd="${ECC_COCKPIT_VENV_CMD:-python3 -m venv}"
+      if ! $venv_cmd "$COCKPIT_VENV" 2>&1; then
+        print_err "Failed to create venv. Try: sudo apt install python3-venv"
+        return 1
+      fi
+      local pip_cmd="${ECC_COCKPIT_PIP_CMD:-$COCKPIT_VENV/bin/pip}"
+      if ! "$pip_cmd" install -q -r "$req_file" 2>&1; then
+        print_err "pip install failed -- check network connectivity."
+        return 1
+      fi
+      [ -n "$req_sha" ] && echo "$req_sha" > "$COCKPIT_REQ_MARKER"
+      print_ok "Command Deck: venv ready"
+    fi
+  fi
+
+  # 3b. Install the ccstatusline binary so the status line renders in BOTH the CLI
+  #     and the Deck. It lands in ~/.npm-global/bin, which statusline-shim.sh adds
+  #     to PATH for the non-login Claude statusLine process. Best-effort, idempotent,
+  #     test seam (ECC_COCKPIT_SKIP_CCSTATUSLINE=1).
+  if [ "${ECC_COCKPIT_SKIP_CCSTATUSLINE:-}" != "1" ] \
+     && ! command -v ccstatusline >/dev/null 2>&1 \
+     && [ ! -x "$HOME/.npm-global/bin/ccstatusline" ] \
+     && command -v npm >/dev/null 2>&1; then
+    print_info "Command Deck: installing ccstatusline (status line)..."
+    if npm install -g --ignore-scripts --prefix "$HOME/.npm-global" ccstatusline@2.2.19 >/dev/null 2>&1; then
+      print_ok "Command Deck: ccstatusline installed"
+    else
+      print_info "Command Deck: ccstatusline not installed (offline?) -- the status line will populate after: npm install -g --ignore-scripts --prefix ~/.npm-global ccstatusline@2.2.19"
+    fi
+  fi
+
+  # 4. Copy shims to COCKPIT_HOME (stable paths used in settings.json hooks)
+  if [ -f "$shim_dir/emit.sh" ]; then
+    cp "$shim_dir/emit.sh" "$COCKPIT_HOME/emit.sh"
+    chmod +x "$COCKPIT_HOME/emit.sh"
+  fi
+  if [ -f "$shim_dir/statusline-shim.sh" ]; then
+    cp "$shim_dir/statusline-shim.sh" "$COCKPIT_HOME/statusline-shim.sh"
+    chmod +x "$COCKPIT_HOME/statusline-shim.sh"
+  fi
+  # Stage the wiring helpers in COCKPIT_HOME too, so `ecc uninstall` can unwire the
+  # statusLine even after the gated content cache has been removed.
+  [ -f "$shim_dir/wire_statusline.py" ] && cp "$shim_dir/wire_statusline.py" "$COCKPIT_HOME/wire_statusline.py"
+  [ -f "$shim_dir/merge_hooks.py" ] && cp "$shim_dir/merge_hooks.py" "$COCKPIT_HOME/merge_hooks.py"
+
+  # 5. Install both ccstatusline configs: the rich personal CLI line + the curated
+  #    Deck line (with a static fallback). See cockpit_write_statusline_configs.
+  cockpit_write_statusline_configs "$shim_dir" "$backend_dir"
+
+  print_ok "Command Deck setup complete (port $COCKPIT_PORT)"
+}
+
+# Start the backend server if not already running (idempotent).
+cockpit_start() {
+  # Already healthy -> idempotent, do not start a second server.
+  if cockpit_health; then
+    print_info "Command Deck already running on port $COCKPIT_PORT"
+    return 0
+  fi
+
+  # Stale pidfile check: if the pid is not alive, clean it.
+  if [ -f "$COCKPIT_PID_FILE" ]; then
+    local old_pid
+    old_pid=$(cat "$COCKPIT_PID_FILE" 2>/dev/null || echo "")
+    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+      rm -f "$COCKPIT_PID_FILE"
+    fi
+  fi
+
+  local cockpit_src backend_dir
+  cockpit_src=$(cockpit_src_dir) || return 1
+  backend_dir="$cockpit_src/backend"
+
+  local python="${ECC_COCKPIT_PYTHON:-$COCKPIT_VENV/bin/python}"
+  # Fall back to system python3 when venv not built (e.g. ECC_COCKPIT_SKIP_VENV=1 in tests)
+  [ -x "$python" ] || python="python3"
+
+  print_info "Starting Command Deck on port $COCKPIT_PORT..."
+  (
+    cd "$backend_dir"
+    PYTHONPATH="$backend_dir" AGENTFORGE_COCKPIT_PORT="$COCKPIT_PORT" \
+      setsid nohup "$python" -m cockpit.run >>"$COCKPIT_LOG" 2>&1 &
+    echo $! > "$COCKPIT_PID_FILE"
+  )
+
+  # Poll health up to ~15s
+  local i=0
+  while [ $i -lt 15 ]; do
+    sleep 1
+    if cockpit_health; then
+      print_ok "Command Deck running at http://127.0.0.1:$COCKPIT_PORT"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+
+  print_err "Command Deck did not start in time.  Log: $COCKPIT_LOG"
+  tail -20 "$COCKPIT_LOG" 2>/dev/null >&2 || true
+  return 1
+}
+
+# Stop the running server via the pidfile.
+cockpit_stop() {
+  if [ ! -f "$COCKPIT_PID_FILE" ]; then
+    print_info "Command Deck: no pidfile at $COCKPIT_PID_FILE (not running or already stopped)"
+    return 0
+  fi
+  local pid
+  pid=$(cat "$COCKPIT_PID_FILE" 2>/dev/null || echo "")
+  rm -f "$COCKPIT_PID_FILE"
+  if [ -z "$pid" ]; then return 0; fi
+  if ! kill -0 "$pid" 2>/dev/null; then
+    print_info "Command Deck: process $pid already gone"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while [ $i -lt 5 ]; do
+    sleep 1
+    kill -0 "$pid" 2>/dev/null || { print_ok "Command Deck stopped (pid $pid)"; return 0; }
+    i=$((i + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  print_ok "Command Deck killed (pid $pid)"
+}
+
+cmd_cockpit() {
+  local do_setup=false
+  local do_stop=false
+  local do_status=false
+  local do_restart=false
+  local no_open=false
+  local install_hooks=false
+  local uninstall_hooks=false
+  local assume_yes=false
+
+  if [ $# -eq 0 ]; then
+    # Default: launch (setup + start + browser)
+    cockpit_setup || true
+    cockpit_start || true
+    open_browser "http://127.0.0.1:$COCKPIT_PORT"
+    return 0
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --setup)           do_setup=true ;;
+      --stop)            do_stop=true ;;
+      --status)          do_status=true ;;
+      --restart)         do_restart=true ;;
+      --no-open)         no_open=true ;;
+      --install-hooks)   install_hooks=true ;;
+      --uninstall-hooks) uninstall_hooks=true ;;
+      -y|--yes)          assume_yes=true ;;
+      -h|--help)
+        echo "Usage: ecc cockpit [--setup|--stop|--status|--restart|--no-open"
+        echo "                    |--install-hooks [--yes]|--uninstall-hooks]"
+        return 0
+        ;;
+      *) print_warn "Unknown cockpit flag: $1" ;;
+    esac
+    shift
+  done
+
+  if [ "$do_status" = true ]; then
+    if cockpit_health; then
+      local pid=""
+      [ -f "$COCKPIT_PID_FILE" ] && pid=$(cat "$COCKPIT_PID_FILE" 2>/dev/null || echo "")
+      print_ok "Command Deck running on port $COCKPIT_PORT${pid:+ (pid $pid)}"
+      print_info "URL: http://127.0.0.1:$COCKPIT_PORT"
+    else
+      print_info "Command Deck not running (port $COCKPIT_PORT)"
+    fi
+    return 0
+  fi
+
+  if [ "$do_stop" = true ]; then
+    cockpit_stop
+    return 0
+  fi
+
+  if [ "$do_restart" = true ]; then
+    cockpit_stop
+    cockpit_setup || true
+    cockpit_start || true
+    open_browser "http://127.0.0.1:$COCKPIT_PORT"
+    return 0
+  fi
+
+  if [ "$install_hooks" = true ]; then
+    local cockpit_src
+    cockpit_src=$(cockpit_src_dir) || return 1
+    local shim_dir="$cockpit_src/shim"
+    local backend_dir="$cockpit_src/backend"
+    local settings="$CLAUDE_DIR/settings.json"
+
+    # Ensure settings.json exists
+    [ -d "$CLAUDE_DIR" ] || mkdir -p "$CLAUDE_DIR"
+    [ -f "$settings" ] || echo '{}' > "$settings"
+
+    if [ "$assume_yes" != true ]; then
+      printf "%s" "Wire cockpit hooks + statusLine into $settings? [y/N] "
+      local ans; read -r ans
+      case "$ans" in
+        y|Y|yes|YES) ;;
+        *) print_info "Cancelled."; return 0 ;;
+      esac
+    fi
+
+    print_info "Merging hooks into $settings..."
+    COCKPIT_HOME="$COCKPIT_HOME" python3 "$shim_dir/merge_hooks.py" "$settings" || {
+      print_warn "Hook merge failed (non-fatal)"
+    }
+
+    print_info "Wiring statusLine shim into $settings..."
+    COCKPIT_HOME="$COCKPIT_HOME" python3 "$shim_dir/wire_statusline.py" "$settings" || {
+      print_warn "StatusLine wire failed (non-fatal)"
+    }
+
+    # Install/refresh both ccstatusline configs (rich CLI line + curated Deck line).
+    cockpit_write_statusline_configs "$shim_dir" "$backend_dir"
+
+    print_ok "Command Deck hooks installed (idempotent -- re-run safely at any time)"
+    return 0
+  fi
+
+  if [ "$uninstall_hooks" = true ]; then
+    local cockpit_src
+    cockpit_src=$(cockpit_src_dir) || return 1
+    local shim_dir="$cockpit_src/shim"
+    local settings="$CLAUDE_DIR/settings.json"
+    if [ -f "$settings" ]; then
+      COCKPIT_HOME="$COCKPIT_HOME" python3 "$shim_dir/wire_statusline.py" "$settings" --unwire || true
+      print_ok "Command Deck statusLine unhooked"
+    fi
+    return 0
+  fi
+
+  if [ "$do_setup" = true ]; then
+    cockpit_setup
+    return 0
+  fi
+
+  if [ "$no_open" = true ]; then
+    cockpit_setup || true
+    cockpit_start || true
+    print_info "Command Deck URL: http://127.0.0.1:$COCKPIT_PORT"
+    return 0
+  fi
+}
+
+# =============================================================================
+# -- Quant Lab --
+# =============================================================================
+
+# Resolve the quantlab source tree from the content root.
+quantlab_src_dir() {
+  resolve_content_root
+  local src="${CONTENT_ROOT:-}/quantlab"
+  if [ -f "$src/backtest/run.py" ]; then
+    echo "$src"
+    return 0
+  fi
+  print_err "Quant Lab content not found - it ships with the Quant Lab SKU."
+  print_info "Activate / refresh with: ecc activate <key>  or  ecc update"
+  return 1
+}
+
+# Deploy the lab source tree into the buyer workspace at $QUANTLAB_HOME.
+#
+# Update semantics (the buyer EDITS this workspace -- their edits must survive):
+#   - config/, strategies/, data/  -> copy-if-absent ONLY (buyer-owned areas;
+#     new files from a release still arrive, existing files are never touched)
+#   - framework files (backtest/, core/, execution/, ml/, ...) -> refreshed,
+#     EXCEPT when the workspace copy was locally modified since we deployed it
+#     (3-way sha check against $QUANTLAB_DEPLOY_MANIFEST); then the local copy
+#     is saved as <file>.bak before the new version lands.
+#   - files removed from a release are left behind in the workspace (no
+#     deletion of buyer files, ever).
+quantlab_deploy() {
+  local src="$1"
+  mkdir -p "$QUANTLAB_HOME"
+  local new_manifest
+  new_manifest=$(mktemp)
+  local copied=0 refreshed=0 kept=0 baks=0
+  local f rel dest src_sha dest_sha last_sha
+  while IFS= read -r -d '' f; do
+    rel="${f#"$src"/}"
+    case "$rel" in
+      *__pycache__*|*.pyc) continue ;;
+    esac
+    dest="$QUANTLAB_HOME/$rel"
+    src_sha=$(sha256sum "$f" | awk '{print $1}')
+    printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
+
+    if [ ! -f "$dest" ]; then
+      mkdir -p "$(dirname "$dest")"
+      cp "$f" "$dest"
+      copied=$((copied + 1))
+      continue
+    fi
+    case "$rel" in
+      # Buyer-owned: never overwrite. data/fixtures/ is NOT listed -- bundled
+      # fixtures are framework files and refresh with releases (buyer's own
+      # datasets elsewhere under data/ are never in the release tree, so the
+      # overwrite path cannot touch them anyway).
+      config/*|strategies/*|data/trades/*|data/state/*|data/models/*)
+        kept=$((kept + 1))
+        continue
+        ;;
+    esac
+    dest_sha=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$dest_sha" = "$src_sha" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    last_sha=""
+    [ -f "$QUANTLAB_DEPLOY_MANIFEST" ] && \
+      last_sha=$(awk -v r="$rel" '$2==r{print $1; exit}' "$QUANTLAB_DEPLOY_MANIFEST")
+    if [ "$dest_sha" != "$last_sha" ]; then
+      # Locally modified (or pre-manifest workspace): never clobber silently.
+      cp "$dest" "$dest.bak"
+      baks=$((baks + 1))
+      print_warn "Locally modified framework file refreshed: $rel (your copy: $rel.bak)"
+    fi
+    cp "$f" "$dest"
+    refreshed=$((refreshed + 1))
+  done < <(find "$src" -type f -print0)
+  mv "$new_manifest" "$QUANTLAB_DEPLOY_MANIFEST"
+  local bak_note=""
+  [ "$baks" -gt 0 ] && bak_note=", $baks saved as .bak"
+  print_ok "Quant Lab workspace: $copied new, $refreshed refreshed, $kept kept$bak_note"
+}
+
+# Pre-warm the lab venv (sha-keyed on requirements.txt, cockpit pattern).
+# Test seams: ECC_QUANTLAB_SKIP_VENV=1, ECC_QUANTLAB_VENV_CMD, ECC_QUANTLAB_PIP_CMD.
+quantlab_venv() {
+  [ "${ECC_QUANTLAB_SKIP_VENV:-}" = "1" ] && return 0
+  local req_file="$QUANTLAB_HOME/requirements.txt"
+  [ -f "$req_file" ] || { print_warn "requirements.txt missing in $QUANTLAB_HOME"; return 1; }
+  local req_sha stored_sha=""
+  req_sha=$(sha256sum "$req_file" | awk '{print $1}')
+  [ -f "$QUANTLAB_REQ_MARKER" ] && stored_sha=$(cat "$QUANTLAB_REQ_MARKER")
+
+  if [ ! -x "$QUANTLAB_VENV/bin/python" ] || [ "$req_sha" != "$stored_sha" ]; then
+    print_info "Quant Lab: building Python venv (first run takes a minute)..."
+    local venv_cmd="${ECC_QUANTLAB_VENV_CMD:-python3 -m venv}"
+    if ! $venv_cmd "$QUANTLAB_VENV" 2>&1; then
+      print_err "Failed to create venv. Try: sudo apt install python3-venv"
+      return 1
+    fi
+    local pip_cmd="${ECC_QUANTLAB_PIP_CMD:-$QUANTLAB_VENV/bin/pip}"
+    if ! "$pip_cmd" install -q -r "$req_file" 2>&1; then
+      print_err "pip install failed -- check network connectivity."
+      return 1
+    fi
+    echo "$req_sha" > "$QUANTLAB_REQ_MARKER"
+    print_ok "Quant Lab: venv ready"
+  fi
+}
+
+quantlab_setup() {
+  local src
+  src=$(quantlab_src_dir) || return 1
+  quantlab_deploy "$src"
+  quantlab_venv || return 1
+  print_ok "Quant Lab ready at $QUANTLAB_HOME"
+}
+
+# Health: workspace + venv + imports + the example-strategy smoke backtest on
+# the bundled fixture (no network, no keys). Exits non-zero on any failure.
+quantlab_doctor() {
+  local fail=0
+  print_header "Quant Lab Doctor"
+
+  if [ -d "$QUANTLAB_HOME" ] && [ -f "$QUANTLAB_HOME/requirements.txt" ]; then
+    print_ok "workspace: $QUANTLAB_HOME"
+  else
+    print_err "workspace missing -- run: ecc quantlab --setup"
+    return 1
+  fi
+
+  local py="${ECC_QUANTLAB_PYTHON:-$QUANTLAB_VENV/bin/python}"
+  if [ -x "$py" ] || command -v "$py" >/dev/null 2>&1; then
+    print_ok "venv python: $py ($("$py" --version 2>&1))"
+  else
+    print_err "venv python missing -- run: ecc quantlab --setup"
+    return 1
+  fi
+
+  if (cd "$QUANTLAB_HOME" && PYTHONPATH="$QUANTLAB_HOME" "$py" - <<'PYEOF'
+import backtest.run, backtest.synth, backtest.walkForward
+import core.bots_config, core.llm_review, core.position_tracker, core.order_submission
+import execution.adapters.paper, execution.risk.engine
+import ml.engine, ml.model, ml.reviewer
+import datafeed.ws_client, agents.base, indicators.core, notifications.telegram
+import strategies.sma_cross.strategy, strategies.sma_cross.backtest_example
+PYEOF
+  ); then
+    print_ok "imports: all lab packages load"
+  else
+    print_err "imports failed -- venv out of date? Run: ecc quantlab --setup"
+    fail=1
+  fi
+
+  if [ "$fail" -eq 0 ]; then
+    print_info "smoke backtest (bundled synthetic fixture)..."
+    if (cd "$QUANTLAB_HOME" && PYTHONPATH="$QUANTLAB_HOME" "$py" -m strategies.sma_cross.backtest_example); then
+      print_ok "smoke backtest: pipeline green"
+    else
+      print_err "smoke backtest failed"
+      fail=1
+    fi
+  fi
+
+  if [ "$fail" -ne 0 ]; then
+    print_err "Quant Lab doctor found problems"
+    return 1
+  fi
+  print_ok "Quant Lab healthy"
+}
+
+cmd_quantlab() {
+  require_jq
+  local do_setup=false do_update=false do_doctor=false
+  if [ $# -eq 0 ]; then
+    do_setup=true
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --setup)  do_setup=true ;;
+      --update) do_update=true ;;
+      --doctor) do_doctor=true ;;
+      -h|--help)
+        echo "Usage: ecc quantlab [--setup|--update|--doctor]"
+        echo "  --setup   Deploy the lab to $QUANTLAB_HOME + build its venv"
+        echo "  --update  Re-deploy after 'ecc update' (your edits are kept;"
+        echo "            modified framework files are saved as .bak first)"
+        echo "  --doctor  Health check + offline smoke backtest"
+        return 0
+        ;;
+      *) print_warn "Unknown quantlab flag: $1" ;;
+    esac
+    shift
+  done
+
+  if [ "$do_setup" = true ] || [ "$do_update" = true ]; then
+    quantlab_setup || return 1
+    if [ "$do_setup" = true ]; then
+      echo ""
+      print_info "Quickstart:"
+      print_info "  cd $QUANTLAB_HOME"
+      print_info "  .venv/bin/python -m strategies.sma_cross.backtest_example   # full pipeline"
+      print_info "  .venv/bin/python -m strategies.sma_cross.paper_replay      # live exit plumbing"
+      print_info "  .venv/bin/python -m pytest tests/ -q                       # the shipped test suite"
+      print_info "  ecc cockpit    # then switch to the Trading Deck (top-left, next to the logo)"
+      print_info "Docs: $QUANTLAB_HOME/docs/README.md"
+    fi
+  fi
+  if [ "$do_doctor" = true ]; then
+    quantlab_doctor || return 1
+  fi
+}
+
+# -- Uninstall: remove only ECC's footprint, never the user's own ~/.claude --
+cmd_uninstall() {
+  local assume_yes=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes|--force) assume_yes=true ;;
+      -h|--help) echo "Usage: ecc uninstall [--yes]"; return 0 ;;
+      *) print_warn "Unknown flag: $1" ;;
+    esac
+    shift
+  done
+
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    print_warn "No AgentForge install found (no registry at $REGISTRY_FILE)."
+    print_info "Nothing to uninstall."
+    return 0
+  fi
+
+  local n_skills n_agents n_templates sec_present=false
+  n_skills=$(registry_list skills | grep -c . || true)
+  n_agents=$(registry_list agents | grep -c . || true)
+  n_templates=$(registry_list templates | grep -c . || true)
+  if jq -e '.features // [] | index("security_hardening")' "$REGISTRY_FILE" >/dev/null 2>&1 || [ -d "$HOME/scripts/security" ]; then
+    sec_present=true
+  fi
+
+  print_header "Uninstall AgentForge"
+  echo "This removes ECC-installed content only:"
+  echo "  - $n_skills skills      ($CLAUDE_DIR/skills/)"
+  echo "  - $n_agents agents      ($CLAUDE_DIR/agents/, ECC's only)"
+  echo "  - rule files            ($CLAUDE_DIR/rules/ecc/)"
+  echo "  - $n_templates templates   ($CLAUDE_DIR/templates/)"
+  echo "  - ECC config + license  ($ECC_CONFIG)"
+  echo "  - installer shell lines (~/.bashrc PATH + API key export)"
+  [ "$sec_present" = true ] && echo "  - Pro security hardening (scripts, daily cron, FIM baseline, env sourcing)"
+  [ -d "$COCKPIT_HOME" ] && echo "  - Command Deck runtime  ($COCKPIT_HOME + launchers + settings wiring)"
+  echo ""
+  echo "Your own Claude skills, agents, and login are preserved."
+  echo "Claude Code itself is NOT removed (npm uninstall -g @anthropic-ai/claude-code)."
+
+  if [ "$assume_yes" != true ]; then
+    printf "%s" "Proceed with uninstall? [y/N] "
+    local ans; read -r ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) print_info "Uninstall cancelled."; return 0 ;;
+    esac
+  fi
+
+  # 1. ECC-installed skills (flat at ~/.claude/skills/<name>/)
+  local item
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -rf "$CLAUDE_DIR/skills/$item"
+  done < <(registry_list skills)
+
+  # 2. ECC-installed agents -- registry-tracked only, never the user's own
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -f "$CLAUDE_DIR/agents/$item.md"
+  done < <(registry_list agents)
+
+  # 3. ECC-installed template metadata
+  while IFS= read -r item; do
+    [ -n "$item" ] && rm -rf "$CLAUDE_DIR/templates/$item"
+  done < <(registry_list templates)
+
+  # 4. Rules tree (installed wholesale by install_rules_all)
+  rm -rf "$CLAUDE_DIR/rules/ecc"
+
+  # 5. Clean any old nested ecc skills dir (migration: pre-flat-install remnants)
+  rm -rf "$CLAUDE_DIR/skills/ecc" 2>/dev/null || true
+
+  # 5b. Pro security hardening footprint -- otherwise the daily cron keeps firing and
+  #     ~/.bashrc keeps sourcing security.env after the product is "uninstalled".
+  if [ "$sec_present" = true ]; then
+    rm -rf "$HOME/scripts/security" "$HOME/.local/security-tools" "$HOME/.secrets/.fim-baseline"
+    rm -f "$HOME/.secrets/security.env" "$HOME/.secrets/audit.log" "$HOME/.local/bin/pip-audit"
+    # crontab is user-global (HOME does not sandbox it); seam-overridable so tests never touch the real crontab.
+    local _crontab="${ECC_CRONTAB_CMD:-crontab}"
+    if "$_crontab" -l 2>/dev/null | grep -q 'daily-audit.sh'; then
+      "$_crontab" -l 2>/dev/null | grep -v 'daily-audit.sh' | grep -v 'AgentForge daily security audit' | "$_crontab" - 2>/dev/null || true
+    fi
+    sed -i '/^# --- AgentForge security secrets ---$/,/^# --- end security secrets ---$/d' "$HOME/.bashrc" 2>/dev/null || true
+  fi
+
+  # 5b2. Command Deck (cockpit) footprint. Restore the user's statusLine and drop the
+  #      cockpit hooks BEFORE removing the runtime, so an opt-in wiring never leaves a
+  #      dangling statusLine command (which would break the CLI status line) or dead hooks.
+  local _settings="$CLAUDE_DIR/settings.json"
+  if [ -f "$_settings" ]; then
+    local _wire=""
+    [ -f "$COCKPIT_HOME/wire_statusline.py" ] && _wire="$COCKPIT_HOME/wire_statusline.py"
+    if [ -z "$_wire" ]; then
+      local _src; _src=$(cockpit_src_dir 2>/dev/null) && [ -f "$_src/shim/wire_statusline.py" ] && _wire="$_src/shim/wire_statusline.py"
+    fi
+    [ -n "$_wire" ] && COCKPIT_HOME="$COCKPIT_HOME" python3 "$_wire" "$_settings" --unwire >/dev/null 2>&1 || true
+    # Drop cockpit hook entries (command references ~/.agentforge/cockpit); keep all others.
+    if command -v jq >/dev/null 2>&1; then
+      local _t; _t=$(mktemp)
+      if jq 'if .hooks then .hooks |= with_entries(.value |= (if type=="array" then map(select(((.hooks // []) | map(.command // "") | any(contains("agentforge/cockpit"))) | not)) else . end)) else . end' "$_settings" > "$_t" 2>/dev/null; then
+        mv "$_t" "$_settings"
+      else
+        rm -f "$_t"
+      fi
+    fi
+  fi
+  rm -rf "$COCKPIT_HOME"
+  rm -f "$HOME/.agentforge-cockpit" "$HOME/.agentforge-claude"
+  rmdir "$HOME/.agentforge" 2>/dev/null || true
+
+  # 5c. Release this device's activation slot at LemonSqueezy BEFORE deleting the
+  #     license file (which holds the instance_id). Best-effort; never blocks teardown.
+  print_info "Releasing device activation slot..."
+  license_deactivate_api
+
+  # 6. ECC config (registry, license, cache, .install-complete)
+  rm -rf "$ECC_CONFIG"
+
+  # 7. Strip the installer's shell-rc additions: each is a distinctive comment
+  #    line followed by its export line, so delete the comment + the next line.
+  local rc
+  for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile"; do
+    [ -f "$rc" ] || continue
+    sed -i \
+      -e '/^# AgentForge -- Anthropic API key$/{N;d;}' \
+      -e '/^# AgentForge$/{N;d;}' \
+      "$rc" 2>/dev/null || true
+  done
+
+  # 8. Installer-managed API key secret (file only, not the ~/.secrets dir)
+  rm -f "$HOME/.secrets/anthropic_api_key"
+
+  print_ok "AgentForge has been uninstalled."
+  [ "$sec_present" = true ] && print_info "Security hardening removed (npm ignore-scripts + .gitignore entries kept as safe defaults)."
+  print_info "Your own Claude config and login were left untouched."
+}
+
+# -- Entry point --
+main() {
+  case "${1:-help}" in
+    install)   shift; cmd_install "$@" ;;
+    update)    cmd_update ;;
+    list)      shift; cmd_list "$@" ;;
+    doctor)    shift; cmd_doctor "$@" ;;
+    activate)  shift; cmd_activate "$@" ;;
+    status)    shift; cmd_status "$@" ;;
+    security)  shift; cmd_security "$@" ;;
+    cockpit)   shift; cmd_cockpit "$@" ;;
+    quantlab)  shift; cmd_quantlab "$@" ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    version)   echo "ecc v$ECC_VERSION" ;;
+    help|--help|-h) cmd_help ;;
+    *)         print_err "Unknown command: $1"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"

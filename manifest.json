@@ -1,0 +1,388 @@
+{
+  "$schema": "https://agentforge.army/manifest/v2.json",
+  "version": "2.1.1",
+  "product": "agentforge",
+  "model": "one-time",
+  "currency": "USD",
+  "tagline": "Your AI team. Ready in 60 seconds. Pay once, own it.",
+  "flagship": {
+    "name": "Deploy Your Army",
+    "skill": "workflow-mode-selector",
+    "tiers": ["starter", "builder", "pro"],
+    "description": "Before any complex or multi-phase build, you choose how it runs: Rapid (orchestrator builds directly, fast) or Deploy Your Army (planner -> tdd-guide -> code-reviewer -> security-reviewer, thorough). You command the army; you decide when to deploy it."
+  },
+
+  "skus": {
+    "starter": {
+      "label": "Starter",
+      "price_onetime": 39,
+      "tagline": "WSL + Ubuntu + Claude Code + the basic agent and skill set.",
+      "description": "A fully configured Claude Code environment with curated developer skills and core agents. The foundation everyone gets. Ready in 60 seconds.",
+      "target_buyer": "Devs who want a clean Claude Code setup without configuring it themselves.",
+      "includes_skus": [],
+      "skills": [
+        "tdd-workflow",
+        "search-first",
+        "verification-loop",
+        "coding-standards",
+        "api-design",
+        "python-patterns",
+        "python-testing",
+        "frontend-patterns",
+        "backend-patterns",
+        "e2e-testing",
+        "database-migrations",
+        "postgres-patterns",
+        "docker-patterns",
+        "deployment-patterns",
+        "github-ops",
+        "deep-research",
+        "research-ops",
+        "market-research",
+        "article-writing",
+        "brand-voice",
+        "agentic-engineering",
+        "autonomous-loops",
+        "iterative-retrieval",
+        "exa-search",
+        "configure-ecc",
+        "workspace-surface-audit",
+        "strategic-compact",
+        "product-capability",
+        "code-tour",
+        "api-connector-builder",
+        "regex-vs-llm-structured-text",
+        "cost-aware-llm-pipeline",
+        "continuous-learning",
+        "security-review",
+        "agent-sort",
+        "workflow-mode-selector",
+        "showcase"
+      ],
+      "agents": [
+        "planner",
+        "code-reviewer",
+        "tdd-guide",
+        "build-error-resolver",
+        "code-explorer",
+        "doc-updater",
+        "docs-lookup",
+        "python-reviewer",
+        "refactor-cleaner",
+        "security-reviewer"
+      ],
+      "rules": "all",
+      "templates": [],
+      "features": {
+        "security_hardening": false,
+        "template_picker": false,
+        "free_updates_months": 12
+      }
+    },
+
+    "builder": {
+      "label": "Builder",
+      "price_onetime": 99,
+      "tagline": "Starter, plus extended developer depth and one production-ready domain template.",
+      "description": "Everything in Starter, plus the full multi-language developer toolkit and one of our four domain templates with agents, skills, sample config, and a workflow guide.",
+      "target_buyer": "Devs with a specific project: trading bot, AI content pipeline, SaaS side project, or prediction-market research.",
+      "includes_skus": ["starter"],
+      "skills": [
+        "golang-patterns",
+        "golang-testing",
+        "rust-patterns",
+        "rust-testing",
+        "cpp-coding-standards",
+        "cpp-testing",
+        "java-coding-standards",
+        "jpa-patterns",
+        "springboot-patterns",
+        "springboot-security",
+        "springboot-tdd",
+        "springboot-verification",
+        "nestjs-patterns",
+        "dotnet-patterns",
+        "csharp-testing",
+        "perl-patterns",
+        "perl-security",
+        "perl-testing",
+        "laravel-patterns",
+        "laravel-plugin-discovery",
+        "laravel-security",
+        "laravel-tdd",
+        "laravel-verification",
+        "django-patterns",
+        "django-security",
+        "django-tdd",
+        "django-verification",
+        "agent-harness-construction",
+        "agent-introspection-debugging",
+        "claude-devfleet",
+        "continuous-agent-loop",
+        "continuous-learning-v2",
+        "council",
+        "dmux-workflows",
+        "eval-harness",
+        "hookify-rules",
+        "nanoclaw-repl",
+        "plankton-code-quality",
+        "ralphinho-rfc-pipeline",
+        "team-builder",
+        "terminal-ops",
+        "security-bounty-hunter",
+        "security-scan",
+        "ai-regression-testing",
+        "ai-first-engineering",
+        "blueprint",
+        "data-scraper-agent",
+        "mcp-server-patterns",
+        "prompt-optimizer",
+        "token-budget-advisor",
+        "skill-stocktake",
+        "clickhouse-io",
+        "content-hash-cache-pattern",
+        "nutrient-document-processing",
+        "customer-billing-ops",
+        "frontend-slides",
+        "project-flow-ops",
+        "visa-doc-translate",
+        "ui-demo"
+      ],
+      "agents": [
+        "architect",
+        "a11y-architect",
+        "code-architect",
+        "code-simplifier",
+        "comment-analyzer",
+        "conversation-analyzer",
+        "cpp-build-resolver",
+        "cpp-reviewer",
+        "csharp-reviewer",
+        "database-reviewer",
+        "e2e-runner",
+        "gan-evaluator",
+        "gan-generator",
+        "gan-planner",
+        "go-build-resolver",
+        "go-reviewer",
+        "harness-optimizer",
+        "java-build-resolver",
+        "java-reviewer",
+        "loop-operator",
+        "opensource-forker",
+        "opensource-packager",
+        "opensource-sanitizer",
+        "performance-optimizer",
+        "pr-test-analyzer",
+        "pytorch-build-resolver",
+        "rust-build-resolver",
+        "rust-reviewer",
+        "silent-failure-hunter",
+        "type-design-analyzer",
+        "typescript-reviewer"
+      ],
+      "rules": "all",
+      "templates_choose_one_from": [
+        "trading",
+        "ai-influencer",
+        "prediction-markets",
+        "indie-saas"
+      ],
+      "features": {
+        "security_hardening": false,
+        "template_picker": true,
+        "free_updates_months": 12
+      }
+    },
+
+    "pro": {
+      "label": "Pro",
+      "price_onetime": 249,
+      "tagline": "Builder, plus every template and the Shai-Hulud cybersecurity hardening suite.",
+      "description": "The full kit: every developer skill, every domain template, and the same cybersecurity defenses we run in our production trading bots.",
+      "target_buyer": "Power users and security-conscious teams running Claude Code in production.",
+      "includes_skus": ["builder"],
+      "skills": [],
+      "agents": [],
+      "rules": "all",
+      "templates": [
+        "trading",
+        "ai-influencer",
+        "prediction-markets",
+        "indie-saas"
+      ],
+      "features": {
+        "security_hardening": true,
+        "template_picker": false,
+        "free_updates_months": 12,
+        "ioc_patch_delivery_months": 12
+      },
+      "security_features": [
+        "FIM (File Integrity Monitoring) of ~/.claude/ config",
+        "Hook integrity check at every SessionStart",
+        "Shai-Hulud supply-chain C2 blocklist",
+        "Daily 9AM audit cron with sane defaults",
+        "npm ignore-scripts hardening with claude-update workaround",
+        "pip-audit on session start",
+        "Encrypted secrets vault at ~/.secrets/",
+        "Telegram tamper alerts (buyer supplies their own bot token)",
+        "Auto-quarantine and restore-from-baseline scripts",
+        "IOC patch delivery for 12 months"
+      ]
+    },
+
+    "quantlab": {
+      "label": "Quant Lab",
+      "price_onetime": 499,
+      "tagline": "The complete algotrading development environment. Bring your ideas; we ship the lab.",
+      "description": "Everything in Pro, plus a working quant workspace deployed to ~/QuantLab: backtest + walk-forward + Monte Carlo validation suite, ML labeling/training pipeline, risk engine with execution safeguards (paper-first), LLM trade-review layer, a worked example strategy wired end-to-end, the shipped test suite, and the methodology docs. Tools, not signals.",
+      "target_buyer": "Builders who want a production-shaped algotrading lab without assembling the plumbing themselves.",
+      "includes_skus": ["pro"],
+      "skills": [],
+      "agents": [],
+      "rules": "all",
+      "templates": [
+        "trading",
+        "ai-influencer",
+        "prediction-markets",
+        "indie-saas"
+      ],
+      "features": {
+        "security_hardening": true,
+        "template_picker": false,
+        "quant_lab": true,
+        "free_updates_months": 12,
+        "ioc_patch_delivery_months": 12
+      }
+    }
+  },
+
+  "templates": {
+    "trading": {
+      "label": "Trading and Financial Markets",
+      "status": "ready",
+      "tagline": "Quantitative agents, backtesting workflows, and risk-managed execution patterns.",
+      "target_buyer": "Quant-curious indie devs and retail traders building tools.",
+      "skills": [
+        "backtesting-patterns",
+        "data-acquisition",
+        "indicator-library",
+        "risk-management",
+        "execution-safeguards",
+        "ml-strategy-patterns",
+        "paper-trading-ops",
+        "trading-journal"
+      ],
+      "agents": [
+        "market-research-analyst",
+        "strategy-architect",
+        "backtest-engineer",
+        "risk-manager",
+        "paper-trading-operator"
+      ],
+      "workflow_doc": "templates/trading/WORKFLOW.md",
+      "sample_config": "templates/trading/sample-config.toml",
+      "starter_prompt": "templates/trading/starter-prompt.md",
+      "showcase_prompt": "templates/trading/showcase-prompt.md",
+      "disclaimer_doc": "templates/trading/DISCLAIMER.md",
+      "legal_disclaimer": "Tools and agents only. No automated execution against live funds out of the box. Buyer assumes all market and regulatory risk."
+    },
+    "ai-influencer": {
+      "label": "AI Influencer and Content Studio",
+      "status": "ready",
+      "tagline": "Image, video, and lip-sync pipelines for at-scale content creation.",
+      "target_buyer": "Creators scaling content output without manual editing.",
+      "skills": [
+        "comfyui-workflows",
+        "character-consistency",
+        "lip-sync-pipelines",
+        "video-generation",
+        "local-gpu-management",
+        "brand-voice-content",
+        "platform-publishing",
+        "content-moderation"
+      ],
+      "agents": [
+        "content-strategist",
+        "character-architect",
+        "pipeline-orchestrator",
+        "distribution-publisher"
+      ],
+      "workflow_doc": "templates/ai-influencer/WORKFLOW.md",
+      "sample_config": "templates/ai-influencer/sample-config.toml",
+      "starter_prompt": "templates/ai-influencer/starter-prompt.md",
+      "showcase_prompt": "templates/ai-influencer/showcase-prompt.md"
+    },
+    "prediction-markets": {
+      "label": "Prediction Markets Analytics",
+      "status": "ready",
+      "tagline": "Read-only research and analytics for Polymarket, Kalshi, and Manifold.",
+      "target_buyer": "Researchers, traders, news analysts.",
+      "skills": [
+        "polymarket-api",
+        "kalshi-api",
+        "manifold-api",
+        "orderbook-analysis",
+        "calibration-scoring",
+        "news-monitoring"
+      ],
+      "agents": [
+        "market-analyst",
+        "event-researcher",
+        "probability-calibrator",
+        "resolution-historian"
+      ],
+      "workflow_doc": "templates/prediction-markets/WORKFLOW.md",
+      "sample_config": "templates/prediction-markets/sample-config.toml",
+      "starter_prompt": "templates/prediction-markets/starter-prompt.md",
+      "showcase_prompt": "templates/prediction-markets/showcase-prompt.md",
+      "disclaimer_doc": "templates/prediction-markets/DISCLAIMER.md",
+      "legal_disclaimer": "Analytics and research only. No trading interfaces ship in this template. Polymarket access is geoblocked in the United States."
+    },
+    "indie-saas": {
+      "label": "Indie SaaS Builder",
+      "status": "ready",
+      "tagline": "Ship side projects fast. Stripe, Next.js, auth, analytics, deployment.",
+      "target_buyer": "Indie hackers and side-project builders.",
+      "skills": [
+        "stripe-patterns",
+        "nextjs-saas-patterns",
+        "auth-clerk-nextauth",
+        "waitlist-launch",
+        "product-pricing-research",
+        "posthog-analytics",
+        "transactional-email",
+        "solo-dev-ops"
+      ],
+      "agents": [
+        "saas-product-strategist",
+        "stripe-integrator",
+        "auth-architect",
+        "nextjs-app-architect",
+        "deployment-orchestrator"
+      ],
+      "workflow_doc": "templates/indie-saas/WORKFLOW.md",
+      "sample_config": "templates/indie-saas/sample-config.toml",
+      "starter_prompt": "templates/indie-saas/starter-prompt.md",
+      "showcase_prompt": "templates/indie-saas/showcase-prompt.md"
+    }
+  },
+
+  "enforcement": {
+    "mode": "local",
+    "license_verification": "lemon-squeezy",
+    "license_file": "~/.ecc/license.json",
+    "fallback_on_offline": "starter",
+    "blocked_action": "warn-and-skip",
+    "buy_url": "https://agentforge.army/buy",
+    "support_email": "support@agentforge.army"
+  },
+
+  "metadata": {
+    "model_change": "Moved from subscription tiers to one-time purchase SKUs in v2.0.0.",
+    "subscription_branch": "subscription-v1",
+    "previous_manifest_version": "1.0.0",
+    "updates_policy": "Free patches, agent updates, and security IOC updates for 12 months from purchase date. After 12 months, an optional updates subscription will be offered.",
+    "schema_convention": "Each SKU lists ONLY the delta (skills, agents) it adds on top of its includes_skus chain. CLI consumers must walk includes_skus transitively to compute the full effective set for a given SKU."
+  }
+}
