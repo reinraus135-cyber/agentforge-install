@@ -9,7 +9,7 @@ if [ -n "${ECC_LOG:-}" ] && mkdir -p "$(dirname "$ECC_LOG")" 2>/dev/null; then
   exec > >(tee -a "$ECC_LOG") 2>&1
 fi
 
-ECC_VERSION="2.3.0"
+ECC_VERSION="2.3.1"
 ECC_DIR="${ECC_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 MANIFEST="$ECC_DIR/manifest.json"
 CLAUDE_DIR="$HOME/.claude"
@@ -1832,6 +1832,20 @@ quantlab_src_dir() {
 #     is saved as <file>.bak before the new version lands.
 #   - files removed from a release are left behind in the workspace (no
 #     deletion of buyer files, ever).
+# sha256 of every buyer-owned file (config/, strategies/) as shipped by PRIOR
+# releases. Lets the updater prove a file is "pristine from an older release"
+# (safe to refresh) vs buyer work (keep). Append-only across releases; the
+# format matches .deployed.sha256 lines. ECC_QUANTLAB_PRIOR_SHAS_EXTRA = test seam.
+quantlab_prior_shipped() {
+  cat <<'PRIOR'
+bf8be480316df5ee924ea42ceb520521a91d552849ddf45398c2d24e708f0c73  strategies/sma_cross/strategy.py
+5850bb5f7c8fd5e9b5e2f948fc58e577f8179434389b0a09857801747aa15b74  strategies/sma_cross/backtest_example.py
+4bacf7d1dc79da333e7c9e2b70c64b4d6a1a72e9a53bc3648da63163a8224a5c  config/bots.example.toml
+PRIOR
+  [ -n "${ECC_QUANTLAB_PRIOR_SHAS_EXTRA:-}" ] && printf '%s\n' "$ECC_QUANTLAB_PRIOR_SHAS_EXTRA"
+  return 0
+}
+
 quantlab_deploy() {
   local src="$1"
   mkdir -p "$QUANTLAB_HOME"
@@ -1846,38 +1860,61 @@ quantlab_deploy() {
     esac
     dest="$QUANTLAB_HOME/$rel"
     src_sha=$(sha256sum "$f" | awk '{print $1}')
-    printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
 
     if [ ! -f "$dest" ]; then
+      printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
       mkdir -p "$(dirname "$dest")"
       cp "$f" "$dest"
       copied=$((copied + 1))
       continue
     fi
     case "$rel" in
-      # Buyer-owned: never overwrite. data/fixtures/ is NOT listed -- bundled
-      # fixtures are framework files and refresh with releases (buyer's own
-      # datasets elsewhere under data/ are never in the release tree, so the
-      # overwrite path cannot touch them anyway).
-      config/*|strategies/*|data/trades/*|data/state/*|data/models/*)
+      # Buyer data outputs: never in the release tree, never overwritten. The
+      # baseline records what is actually on disk, since nothing was deployed.
+      data/trades/*|data/state/*|data/models/*)
+        printf '%s  %s\n' "$(sha256sum "$dest" | awk '{print $1}')" "$rel" >> "$new_manifest"
         kept=$((kept + 1))
         continue
         ;;
     esac
     dest_sha=$(sha256sum "$dest" | awk '{print $1}')
     if [ "$dest_sha" = "$src_sha" ]; then
+      printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
       kept=$((kept + 1))
       continue
     fi
     last_sha=""
     [ -f "$QUANTLAB_DEPLOY_MANIFEST" ] && \
       last_sha=$(awk -v r="$rel" '$2==r{print $1; exit}' "$QUANTLAB_DEPLOY_MANIFEST")
+    case "$rel" in
+      # Buyer-owned (the files docs tell buyers to edit). Refresh ONLY when the
+      # current copy is provably pristine: it matches the recorded baseline, or
+      # byte-matches a version some prior release shipped (heals baselines that
+      # a pre-fix updater recorded wrongly). Anything else is buyer work: keep
+      # it untouched and carry the old baseline forward so a later release can
+      # still tell pristine from modified. data/fixtures/ is NOT here -- bundled
+      # fixtures are framework files and refresh with releases.
+      config/*|strategies/*)
+        if [ "$dest_sha" = "$last_sha" ] || quantlab_prior_shipped | grep -Fxq "$dest_sha  $rel"; then
+          printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
+          cp "$f" "$dest"
+          refreshed=$((refreshed + 1))
+        else
+          # No baseline at all (pre-manifest workspace): record nothing, so the
+          # file stays buyer-owned forever rather than being blessed by accident.
+          [ -n "$last_sha" ] && printf '%s  %s\n' "$last_sha" "$rel" >> "$new_manifest"
+          kept=$((kept + 1))
+        fi
+        continue
+        ;;
+    esac
     if [ "$dest_sha" != "$last_sha" ]; then
       # Locally modified (or pre-manifest workspace): never clobber silently.
       cp "$dest" "$dest.bak"
       baks=$((baks + 1))
       print_warn "Locally modified framework file refreshed: $rel (your copy: $rel.bak)"
     fi
+    printf '%s  %s\n' "$src_sha" "$rel" >> "$new_manifest"
     cp "$f" "$dest"
     refreshed=$((refreshed + 1))
   done < <(find "$src" -type f -print0)
