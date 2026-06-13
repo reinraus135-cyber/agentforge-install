@@ -20,17 +20,14 @@ Deck** while it runs - each agent lights up as it is deployed.
 | You have | `/showcase` deploys | You keep |
 |---|---|---|
 | **Starter** (no template) | planner -> tdd-guide -> code-reviewer -> security-reviewer | a small, tested, reviewed, security-checked utility |
-| **Builder** (one template) | that template's domain squad | the template's real first deliverable |
-| **Pro** (all four) | asks which squad first, then that one | that squad's deliverable (run again for the others) |
+| **Builder** (every template) | asks which squad first, then that one | that squad's deliverable (run again for the others) |
+| **Pro** (every template) | asks which squad first, then that one | that squad's deliverable (run again for the others) |
 
 Per template, the squad and the kept artifact:
 
 - **Trading** - market-research-analyst -> strategy-architect -> backtest-engineer ->
   risk-manager. You keep a pressure-tested hypothesis, a typed strategy spec, a backtest
   plan, and a risk review. Paper/research only.
-- **AI Influencer** - content-strategist -> character-architect -> content-strategist. You
-  keep a persona character sheet and three on-brand posts. (Rendering needs a GPU; the plan
-  does not.)
 - **Indie SaaS** - saas-product-strategist -> nextjs-app-architect -> auth-architect ->
   stripe-integrator. You keep a validated brief and the auth + billing scaffold plan.
 - **Prediction Markets** - market-analyst -> event-researcher -> probability-calibrator. You

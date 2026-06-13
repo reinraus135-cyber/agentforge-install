@@ -53,17 +53,17 @@ Three one-time SKUs. Pay once, own it, with 12 months of free updates.
 
 ### Builder -- $99
 
-Everything in Starter, plus extended multi-language depth and **one** domain template you choose:
+Everything in Starter, plus extended multi-language depth and **every** domain template:
 
 | | Count | Examples |
 |---|---|---|
 | **Skills** | +59 | Go, Rust, Java, C++, C#, Laravel, Django, NestJS, agent harness, eval harness, council, prompt optimizer |
 | **Agents** | +31 | architect, e2e-runner, performance-optimizer, GAN pipeline, rust-reviewer, typescript-reviewer |
-| **Template** | 1 of 4 | trading, ai-influencer, prediction-markets, indie-saas |
+| **Templates** | all | trading, prediction-markets, indie-saas |
 
 ### Pro -- $249
 
-Everything in Builder, plus **all four** templates and the Shai-Hulud cybersecurity hardening suite (file-integrity monitoring, hook-integrity checks, supply-chain C2 blocklist, daily audit, IOC patches for 12 months).
+Everything in Builder -- including every domain template -- plus the Shai-Hulud cybersecurity hardening suite (file-integrity monitoring, hook-integrity checks, supply-chain C2 blocklist, daily audit, IOC patches for 12 months).
 
 ### Quant Lab -- $499
 

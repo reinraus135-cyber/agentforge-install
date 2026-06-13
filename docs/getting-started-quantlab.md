@@ -13,7 +13,7 @@ methodology docs. Pay once, own it. We sell shovels, not signals.
 ecc activate YOUR-LICENSE-KEY
 ```
 
-This installs the full Pro set (all skills, agents, all four templates,
+This installs the full Pro set (all skills, agents, every domain template,
 security hardening) AND downloads the Quant Lab content. Your license lands
 in `~/.ecc/license.json`. If the Windows installer ran activation, skip
 to step 2.

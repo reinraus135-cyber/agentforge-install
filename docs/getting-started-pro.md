@@ -1,7 +1,7 @@
 # Getting Started: Pro
 
-You bought **Pro ($249, one-time)**: everything in Builder, plus **all four**
-domain templates and the Shai-Hulud cybersecurity hardening suite we run in our
+You bought **Pro ($249, one-time)**: everything in Builder -- including every
+domain template -- plus the Shai-Hulud cybersecurity hardening suite we run in our
 own production bots. Pay once, own it.
 
 ## 1. Activate your license
@@ -10,20 +10,21 @@ own production bots. Pay once, own it.
 ecc activate YOUR-LICENSE-KEY
 ```
 
-This installs everything: the full skill/agent set, all four templates, and the
+This installs everything: the full skill/agent set, every domain template, and the
 security hardening (no-sudo mode). Your license is saved to
 `~/.ecc/license.json`. If the Windows installer ran activation, skip to step 3.
 
 ## 2. What got installed
 
-- Everything in **Starter** and **Builder** (full skill/agent toolkit)
-- **All four templates**: `trading`, `ai-influencer`, `prediction-markets`,
-  `indie-saas` -- each in `~/.claude/templates/<name>/`
+- Everything in **Starter** and **Builder** (full skill/agent toolkit + every
+  domain template)
+- **Every domain template**: `trading`, `prediction-markets`, `indie-saas` --
+  each in `~/.claude/templates/<name>/`
 - The **cybersecurity hardening suite** (no-sudo parts installed automatically)
 
 ```bash
 ecc status      # SKU=pro
-ecc list        # all skills, agents, and four templates
+ecc list        # all skills, agents, and every template
 ```
 
 > `trading` and `prediction-markets` ship a `DISCLAIMER.md`. Tools and research
@@ -67,7 +68,7 @@ Alerts use **your own** Telegram bot, so no data leaves your control:
 claude
 ```
 
-**Meet your squads first** - type `/showcase`. You have all four templates, so it asks
+**Meet your squads first** - type `/showcase`. You have every template, so it asks
 which squad to meet first, then deploys it on a concrete bounded task while the Command
 Deck lights up. Run it again for each of the others. See
 [showcase-quickstart.md](showcase-quickstart.md).
@@ -80,7 +81,7 @@ Then pick the template that fits the job and follow its
 | Command | What it does |
 |---|---|
 | `ecc security --check` | Security install status |
-| `ecc list` | All installed content (four templates included) |
+| `ecc list` | All installed content (every template included) |
 | `ecc install --template <name>` | Re-install a specific template |
 | `ecc update` | Pull latest skills, agents, and IOC patches |
 | `ecc status` | SKU, license, counts |

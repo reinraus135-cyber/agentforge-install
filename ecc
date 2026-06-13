@@ -470,12 +470,7 @@ content_shape() {
     starter)  echo "starter" ;;
     pro)      echo "pro" ;;
     quantlab) echo "quantlab" ;;
-    builder)
-      if [ -z "$template" ] || [ "$template" = "null" ]; then
-        print_err "Builder content requires a template. Use --template <name>, or re-activate your key." >&2
-        return 1
-      fi
-      echo "builder-$template" ;;
+    builder)  echo "builder" ;;
     *) print_err "No content shape for SKU: $sku" >&2; return 1 ;;
   esac
 }
@@ -567,9 +562,6 @@ ensure_content() {
   if have_local_content; then
     resolve_content_root
     return 0
-  fi
-  if [ "$sku" = "builder" ] && { [ -z "$template" ] || [ "$template" = "null" ]; }; then
-    template="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
   fi
   local want_shape
   want_shape=$(content_shape "$sku" "$template") || return 1
@@ -756,34 +748,16 @@ cmd_install() {
 
   install_rules_all
 
-  # Builder: install one chosen template.
-  # Precedence: AGENTFORGE_TEMPLATE env > license-derived template > interactive hint.
-  if [ "$target_sku" = "builder" ]; then
-    local chosen_template="${AGENTFORGE_TEMPLATE:-}"
-    if [ -z "$chosen_template" ]; then
-      chosen_template=$(license_read_field "template")
-    fi
-    if [ -n "$chosen_template" ] && [ "$chosen_template" != "null" ]; then
-      print_info "Installing your selected Builder template: $chosen_template"
-      install_template "$chosen_template"
-    else
-      print_header "Builder Template Selection"
-      print_info "Builder SKU includes one template. Choose one:"
-      for tmpl in $(manifest_template_names); do
-        local label status
-        label=$(manifest_template_label "$tmpl")
-        status=$(manifest_template_status "$tmpl")
-        print_info "  ecc install --template $tmpl     [$status]  $label"
-      done
-    fi
-  fi
-
-  # Pro and Quant Lab (includes Pro): install all templates + security hardening
-  if [ "$target_sku" = "pro" ] || [ "$target_sku" = "quantlab" ]; then
-    print_header "Pro Templates"
+  # Builder, Pro, and Quant Lab all install every domain template.
+  if [ "$target_sku" = "builder" ] || [ "$target_sku" = "pro" ] || [ "$target_sku" = "quantlab" ]; then
+    print_header "Domain Templates"
     for tmpl in $(manifest_template_names); do
       install_template "$tmpl" || true
     done
+  fi
+
+  # Pro and Quant Lab (includes Pro) additionally install the security hardening suite.
+  if [ "$target_sku" = "pro" ] || [ "$target_sku" = "quantlab" ]; then
     if [ "$(jq -r '.skus.pro.features.security_hardening' "$MANIFEST")" = "true" ]; then
       install_security_hardening
     fi
@@ -818,21 +792,6 @@ derive_sku_from_product() {
   elif [[ "$combined" == *"builder"* ]]; then echo "builder"
   elif [[ "$combined" == *"starter"* ]]; then echo "starter"
   else echo "starter"; fi
-}
-
-# Map a LemonSqueezy variant name to a Builder template choice.
-# Builder buyers pick 1 of 4 templates; the choice rides on the variant name.
-# Order matters: prediction-markets is checked before trading so its "market"
-# substring does not get swallowed by the trading branch. Returns "" if no match.
-derive_template_from_variant() {
-  local v="${1,,}"
-  case "$v" in
-    *prediction*|*polymarket*|*kalshi*|*manifold*) echo "prediction-markets" ;;
-    *influencer*|*content*|*studio*)               echo "ai-influencer" ;;
-    *saas*|*indie*|*startup*)                       echo "indie-saas" ;;
-    *trading*|*financial*|*market*|*quant*)         echo "trading" ;;
-    *) echo "" ;;
-  esac
 }
 
 license_validate_api() {
@@ -880,12 +839,6 @@ license_validate_api() {
 
   _LS_SKU=$(derive_sku_from_product "$product_name" "$variant_name")
 
-  # Builder buyers pick one template; resolve it from the variant name.
-  _LS_TEMPLATE=""
-  if [ "$_LS_SKU" = "builder" ]; then
-    _LS_TEMPLATE=$(derive_template_from_variant "$variant_name")
-  fi
-
   rm -f "$response"
 
   # A freshly issued key is "inactive" until its first activation (performed by
@@ -930,8 +883,8 @@ license_revalidate_if_stale() {
     if license_validate_api "$key"; then
       local tmp_license
       tmp_license=$(mktemp)
-      jq --arg sku "$_LS_SKU" --arg email "$_LS_EMAIL" --arg tmpl "${_LS_TEMPLATE:-}" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '.sku = $sku | .customer_email = $email | .validated_at = $ts | (if $tmpl != "" then .template = $tmpl else . end)' "$LICENSE_FILE" > "$tmp_license" \
+      jq --arg sku "$_LS_SKU" --arg email "$_LS_EMAIL" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.sku = $sku | .customer_email = $email | .validated_at = $ts' "$LICENSE_FILE" > "$tmp_license" \
         && mv "$tmp_license" "$LICENSE_FILE"
       print_ok "License still active"
     else
@@ -991,7 +944,6 @@ cmd_activate() {
   "license_key": "$key",
   "status": "active",
   "sku": "$_LS_SKU",
-  "template": "${_LS_TEMPLATE:-}",
   "instance_id": "$prev_instance",
   "expires_at": null,
   "customer_email": "$_LS_EMAIL",
@@ -1003,9 +955,6 @@ ENDJSON
   print_ok "License activated successfully"
   print_info "Email: $_LS_EMAIL"
   print_info "SKU:   $_LS_SKU"
-  if [ -n "${_LS_TEMPLATE:-}" ]; then
-    print_info "Template: $_LS_TEMPLATE"
-  fi
 
   echo ""
   print_info "Installing $_LS_SKU content..."
@@ -1042,10 +991,9 @@ show_license_detail() {
     return
   fi
 
-  local status sku tmpl email activated
+  local status sku email activated
   status=$(license_read_field "status")
   sku=$(license_read_field "sku")
-  tmpl=$(license_read_field "template")
   email=$(license_read_field "customer_email")
   activated=$(license_read_field "activated_at")
   [ -z "$activated" ] && activated=$(license_read_field "validated_at")
@@ -1053,7 +1001,6 @@ show_license_detail() {
   echo "SKU:          ${sku:-unknown} (one-time, lifetime ownership)"
   echo "Status:       ${status:-unknown}"
   [ -n "$email" ] && [ "$email" != "null" ] && echo "Customer:     $email"
-  [ -n "$tmpl" ]  && [ "$tmpl" != "null" ]  && echo "Template:     $tmpl"
   [ -n "$activated" ] && [ "$activated" != "null" ] && echo "Activated:    ${activated:0:10}"
   echo "$(printf '%.0s-' {1..40})"
 
@@ -1329,13 +1276,11 @@ cmd_update() {
 
   # Refresh entitled content from the gateway unless a local checkout supplies it.
   if ! have_local_content; then
-    local up_sku up_tmpl up_shape
+    local up_sku up_shape
     up_sku=$(detect_sku)
-    up_tmpl=""
-    [ "$up_sku" = "builder" ] && up_tmpl="${AGENTFORGE_TEMPLATE:-$(license_read_field template)}"
-    if up_shape=$(content_shape "$up_sku" "$up_tmpl" 2>/dev/null); then
+    if up_shape=$(content_shape "$up_sku" "" 2>/dev/null); then
       print_info "Refreshing $up_sku content..."
-      fetch_content "$up_sku" "$up_tmpl" "$up_shape" || print_warn "Content refresh failed -- using cached content"
+      fetch_content "$up_sku" "" "$up_shape" || print_warn "Content refresh failed -- using cached content"
     fi
   fi
   require_content
@@ -1379,7 +1324,7 @@ cmd_help() {
   echo "  ${BOLD}install${RESET} --sku starter      Install Starter SKU explicitly"
   echo "  ${BOLD}install${RESET} --sku builder      Install Builder SKU (requires license)"
   echo "  ${BOLD}install${RESET} --sku pro          Install Pro SKU (requires license)"
-  echo "  ${BOLD}install${RESET} --template NAME    Install a template (Builder: 1, Pro: all)"
+  echo "  ${BOLD}install${RESET} --template NAME    Install a domain template (Builder/Pro: all)"
   echo "  ${BOLD}install${RESET} SKILL              Install a single skill by name"
   echo "  ${BOLD}activate${RESET} KEY               Activate a one-time license (auto-installs SKU)"
   echo "  ${BOLD}update${RESET}                     Pull latest and re-install"
@@ -1409,15 +1354,14 @@ cmd_help() {
   echo ""
   echo "SKUs (one-time purchase, no subscription):"
   echo "  ${GREEN}Starter${RESET}   \$39   -- WSL + Ubuntu + Claude Code + basic agent/skill set"
-  echo "  ${BLUE}Builder${RESET}   \$99   -- Starter + multi-language depth + 1 domain template"
-  echo "  ${PURPLE}Pro${RESET}       \$249  -- Builder + all 4 templates + cybersecurity hardening"
+  echo "  ${BLUE}Builder${RESET}   \$99   -- Starter + multi-language depth + every domain template"
+  echo "  ${PURPLE}Pro${RESET}       \$249  -- Builder + cybersecurity hardening"
   echo "  ${BOLD}Quant Lab${RESET} \$499  -- Pro + the complete algotrading development workspace"
   echo ""
   echo "Templates: $(manifest_template_names 2>/dev/null | tr '\n' ', ' | sed 's/,$//')"
   echo ""
   echo "Env vars:"
   echo "  AGENTFORGE_SKU=starter|builder|pro    -- override license-derived SKU"
-  echo "  AGENTFORGE_TEMPLATE=<name>            -- override the Builder template (else license choice is used)"
   echo ""
   echo "Get started: ecc install"
   echo "Buy:         $(manifest_buy_url 2>/dev/null || echo "$DEFAULT_BUY_URL")"

@@ -11,9 +11,9 @@ Pick the SKU you bought:
 - **[Starter ($39)](getting-started-starter.md)** -- WSL + Ubuntu + Claude Code
   + 35 skills + 10 core agents. The 60-second setup.
 - **[Builder ($99)](getting-started-builder.md)** -- Starter + the full
-  multi-language toolkit + one domain template of your choice.
-- **[Pro ($249)](getting-started-pro.md)** -- Builder + all four templates + the
-  cybersecurity hardening suite.
+  multi-language toolkit + every domain template.
+- **[Pro ($249)](getting-started-pro.md)** -- Builder + the cybersecurity
+  hardening suite.
 
 Not sure / want to upgrade later? Any SKU can run `ecc list --available` to see
 locked content, and upgrading is just a new purchase plus `ecc activate`.
@@ -54,7 +54,7 @@ then `ecc activate <key>`. Content downloads only after your key validates.
 |---|---|
 | `ecc activate KEY` | Activate a one-time license and install its SKU |
 | `ecc install` | Install your SKU (auto-detected from license) |
-| `ecc install --template NAME` | Install a domain template (Builder: 1, Pro: all) |
+| `ecc install --template NAME` | Install a domain template (Builder/Pro: all) |
 | `ecc install SKILL` | Install a single skill by name |
 | `ecc list` | Show what is installed |
 | `ecc list --available` | Show everything available, with your upgrade path |

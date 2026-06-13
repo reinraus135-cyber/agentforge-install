@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentforge.army/manifest/v2.json",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "product": "agentforge",
   "model": "one-time",
   "currency": "USD",
@@ -83,9 +83,9 @@
     "builder": {
       "label": "Builder",
       "price_onetime": 99,
-      "tagline": "Starter, plus extended developer depth and one production-ready domain template.",
-      "description": "Everything in Starter, plus the full multi-language developer toolkit and one of our four domain templates with agents, skills, sample config, and a workflow guide.",
-      "target_buyer": "Devs with a specific project: trading bot, AI content pipeline, SaaS side project, or prediction-market research.",
+      "tagline": "Starter, plus extended developer depth and every production-ready domain template.",
+      "description": "Everything in Starter, plus the full multi-language developer toolkit and every domain template -- each with its own agents, skills, sample config, and workflow guide.",
+      "target_buyer": "Devs with a specific project: a trading bot, a SaaS side project, or prediction-market research -- with the full toolkit to ship it.",
       "includes_skus": ["starter"],
       "skills": [
         "golang-patterns",
@@ -182,15 +182,14 @@
         "typescript-reviewer"
       ],
       "rules": "all",
-      "templates_choose_one_from": [
+      "templates": [
         "trading",
-        "ai-influencer",
         "prediction-markets",
         "indie-saas"
       ],
       "features": {
         "security_hardening": false,
-        "template_picker": true,
+        "template_picker": false,
         "free_updates_months": 12
       }
     },
@@ -198,8 +197,10 @@
     "pro": {
       "label": "Pro",
       "price_onetime": 249,
-      "tagline": "Builder, plus every template and the Shai-Hulud cybersecurity hardening suite.",
-      "description": "The full kit: every developer skill, every domain template, and the same cybersecurity defenses we run in our production trading bots.",
+      "price_intro": 149,
+      "intro_units": 1000,
+      "tagline": "Builder, plus the Shai-Hulud cybersecurity hardening suite we run on our own trading bots.",
+      "description": "Everything in Builder -- every developer skill and every domain template -- plus the same cybersecurity defenses we run in our production trading bots.",
       "target_buyer": "Power users and security-conscious teams running Claude Code in production.",
       "includes_skus": ["builder"],
       "skills": [],
@@ -207,7 +208,6 @@
       "rules": "all",
       "templates": [
         "trading",
-        "ai-influencer",
         "prediction-markets",
         "indie-saas"
       ],
@@ -243,7 +243,6 @@
       "rules": "all",
       "templates": [
         "trading",
-        "ai-influencer",
         "prediction-markets",
         "indie-saas"
       ],
@@ -286,32 +285,6 @@
       "showcase_prompt": "templates/trading/showcase-prompt.md",
       "disclaimer_doc": "templates/trading/DISCLAIMER.md",
       "legal_disclaimer": "Tools and agents only. No automated execution against live funds out of the box. Buyer assumes all market and regulatory risk."
-    },
-    "ai-influencer": {
-      "label": "AI Influencer and Content Studio",
-      "status": "ready",
-      "tagline": "Image, video, and lip-sync pipelines for at-scale content creation.",
-      "target_buyer": "Creators scaling content output without manual editing.",
-      "skills": [
-        "comfyui-workflows",
-        "character-consistency",
-        "lip-sync-pipelines",
-        "video-generation",
-        "local-gpu-management",
-        "brand-voice-content",
-        "platform-publishing",
-        "content-moderation"
-      ],
-      "agents": [
-        "content-strategist",
-        "character-architect",
-        "pipeline-orchestrator",
-        "distribution-publisher"
-      ],
-      "workflow_doc": "templates/ai-influencer/WORKFLOW.md",
-      "sample_config": "templates/ai-influencer/sample-config.toml",
-      "starter_prompt": "templates/ai-influencer/starter-prompt.md",
-      "showcase_prompt": "templates/ai-influencer/showcase-prompt.md"
     },
     "prediction-markets": {
       "label": "Prediction Markets Analytics",
