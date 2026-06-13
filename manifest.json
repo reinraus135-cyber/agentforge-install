@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentforge.army/manifest/v2.json",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "product": "agentforge",
   "model": "one-time",
   "currency": "USD",
@@ -185,7 +185,9 @@
       "templates": [
         "trading",
         "prediction-markets",
-        "indie-saas"
+        "indie-saas",
+        "devops-infra",
+        "web"
       ],
       "features": {
         "security_hardening": false,
@@ -209,7 +211,9 @@
       "templates": [
         "trading",
         "prediction-markets",
-        "indie-saas"
+        "indie-saas",
+        "devops-infra",
+        "web"
       ],
       "features": {
         "security_hardening": true,
@@ -244,7 +248,9 @@
       "templates": [
         "trading",
         "prediction-markets",
-        "indie-saas"
+        "indie-saas",
+        "devops-infra",
+        "web"
       ],
       "features": {
         "security_hardening": true,
@@ -338,6 +344,58 @@
       "sample_config": "templates/indie-saas/sample-config.toml",
       "starter_prompt": "templates/indie-saas/starter-prompt.md",
       "showcase_prompt": "templates/indie-saas/showcase-prompt.md"
+    },
+    "devops-infra": {
+      "label": "DevOps and Infrastructure",
+      "status": "ready",
+      "tagline": "Terraform, CI/CD, containers/Kubernetes, and observability for shipping and running services.",
+      "target_buyer": "Platform and backend engineers automating infra, deploys, and operations.",
+      "skills": [
+        "terraform-iac",
+        "kubernetes-patterns",
+        "github-actions-cicd",
+        "observability-monitoring",
+        "cloud-cost-optimization",
+        "secrets-config-management",
+        "incident-runbooks"
+      ],
+      "agents": [
+        "infra-architect",
+        "iac-writer",
+        "cicd-builder",
+        "container-k8s-specialist",
+        "observability-cost-reviewer"
+      ],
+      "workflow_doc": "templates/devops-infra/WORKFLOW.md",
+      "sample_config": "templates/devops-infra/sample-config.toml",
+      "starter_prompt": "templates/devops-infra/starter-prompt.md",
+      "showcase_prompt": "templates/devops-infra/showcase-prompt.md"
+    },
+    "web": {
+      "label": "Web and Frontend",
+      "status": "ready",
+      "tagline": "Design systems, component architecture, motion, performance, and accessibility for production web.",
+      "target_buyer": "Frontend and full-stack devs building polished, fast, accessible web apps and sites.",
+      "skills": [
+        "design-systems-tokens",
+        "component-architecture",
+        "modern-css-layout",
+        "web-animation-motion",
+        "core-web-vitals",
+        "accessibility-wcag",
+        "seo-technical"
+      ],
+      "agents": [
+        "web-design-architect",
+        "frontend-component-architect",
+        "motion-interaction-designer",
+        "web-performance-optimizer",
+        "a11y-seo-auditor"
+      ],
+      "workflow_doc": "templates/web/WORKFLOW.md",
+      "sample_config": "templates/web/sample-config.toml",
+      "starter_prompt": "templates/web/starter-prompt.md",
+      "showcase_prompt": "templates/web/showcase-prompt.md"
     }
   },
 

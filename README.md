@@ -59,7 +59,7 @@ Everything in Starter, plus extended multi-language depth and **every** domain t
 |---|---|---|
 | **Skills** | +59 | Go, Rust, Java, C++, C#, Laravel, Django, NestJS, agent harness, eval harness, council, prompt optimizer |
 | **Agents** | +31 | architect, e2e-runner, performance-optimizer, GAN pipeline, rust-reviewer, typescript-reviewer |
-| **Templates** | all | trading, prediction-markets, indie-saas |
+| **Templates** | all | trading, prediction-markets, indie-saas, devops-infra, web |
 
 ### Pro -- $249
 
