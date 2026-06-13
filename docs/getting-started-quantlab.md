@@ -66,6 +66,14 @@ copying the example package.
 Open the cockpit (`ecc cockpit`) and use the deck switcher next to the
 AgentForge logo (top-left) -- Quant Lab installs add a **Trading Deck**:
 
+- **Paper runners** (the hero row) -- one live card per strategy, Strike AND
+  ML side by side. Every card has the same transport: **Backtest** (your
+  chosen window of recent real candles -- ML cards train walk-forward inside
+  it), **Demo** (the bundled synthetic year, offline) and **Go live** (paper
+  on the venue's real-time public feed, no keys). A finished backtest shows
+  its **go/no-go gate verdict** right on the card, criterion by criterion --
+  the shipped example fails its own gate by design, and that honesty is the
+  product.
 - **Strike** -- tune the rule-based methodology's geometry (TP/SL, holds,
   trailing, sizing, the example's SMA pair) with bounded, validated fields.
 - **ML Lab** -- the ML profile's gates, labeling horizon, retrain cadence,
@@ -74,7 +82,8 @@ AgentForge logo (top-left) -- Quant Lab installs add a **Trading Deck**:
   why). The lab's `manual` bias source feeds it to reviewers and the ML
   long-veto gate as a soft input; it goes stale after 24h on purpose.
 - **Add Strategy** -- name + one sentence of idea, and Claude opens a plan
-  in the Deck terminal scaffolded from the worked example.
+  in the Deck terminal scaffolded from the worked example. The new section
+  gets its own runner card automatically.
 
 Edits write `~/QuantLab/config/bots.toml` (born from the example on first
 save, timestamped backup kept) and apply on the next run. The Deck edits
@@ -82,10 +91,14 @@ geometry only -- no safety switch is reachable from the UI.
 
 ## 6. Your edits are safe across updates
 
-`config/`, `strategies/`, and your own datasets under `data/` are YOURS --
-`ecc quantlab --update` never overwrites them (the bundled `data/fixtures/`
-refreshes with releases like any framework file). Framework files you
-modified are saved as `<file>.bak` before a refresh replaces them.
+Your WORK is what is protected, not stale copies: `ecc quantlab --update`
+keeps any `config/` or `strategies/` file you EDITED exactly as you left it
+(your baseline is carried forward release after release), while pristine
+example files refresh with releases -- so the worked example keeps up with
+the framework it teaches. Your own datasets under `data/` are never touched
+(the bundled `data/fixtures/` refreshes like any framework file). Framework
+files elsewhere that you modified are saved as `<file>.bak` before a refresh
+replaces them.
 
 ```bash
 ecc update             # refresh content (12 months of updates included)

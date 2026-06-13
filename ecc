@@ -2005,6 +2005,16 @@ PYEOF
     fi
   fi
 
+  if [ "$fail" -eq 0 ]; then
+    print_info "ML smoke (tiny walk-forward on the bundled fixture)..."
+    if (cd "$QUANTLAB_HOME" && PYTHONPATH="$QUANTLAB_HOME" "$py" -m core.ml_runner --selftest); then
+      print_ok "ML smoke: walk-forward pipeline green"
+    else
+      print_err "ML smoke failed -- sklearn or the runner is unhappy on this box"
+      fail=1
+    fi
+  fi
+
   if [ "$fail" -ne 0 ]; then
     print_err "Quant Lab doctor found problems"
     return 1
