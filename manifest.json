@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentforge.army/manifest/v2.json",
-  "version": "2.5.0",
+  "version": "2.6.0",
   "product": "agentforge",
   "model": "one-time",
   "currency": "USD",
