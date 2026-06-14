@@ -763,8 +763,8 @@ cmd_install() {
     fi
   fi
 
-  # Quant Lab: deploy the workspace + pre-warm its venv
-  if [ "$target_sku" = "quantlab" ]; then
+  # Pro (Quant Lab showcase) and Quant Lab: deploy the workspace + pre-warm its venv
+  if [ "$target_sku" = "pro" ] || [ "$target_sku" = "quantlab" ]; then
     print_header "Quant Lab"
     quantlab_setup || print_warn "Quant Lab setup incomplete -- run: ecc quantlab --setup"
   fi
@@ -1989,6 +1989,15 @@ cmd_quantlab() {
     esac
     shift
   done
+
+  # Quant Lab ships in Pro (as a showcase) and the legacy Quant Lab SKU.
+  local owned_sku
+  owned_sku=$(detect_sku)
+  if ! check_sku_access "pro" "$owned_sku"; then
+    print_warn "Quant Lab is a Pro feature (you have: $owned_sku)"
+    print_info "Buy at: $(manifest_buy_url)"
+    return 1
+  fi
 
   if [ "$do_setup" = true ] || [ "$do_update" = true ]; then
     quantlab_setup || return 1

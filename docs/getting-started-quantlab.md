@@ -1,7 +1,7 @@
 # Getting Started: Quant Lab
 
-You bought **Quant Lab ($499, one-time)**: everything in **Pro**, plus a
-working algotrading development workspace -- backtest + walk-forward + Monte
+The **Quant Lab** ships in **Pro** (as a showcase) and the legacy standalone Quant
+Lab tier: a working algotrading development workspace -- backtest + walk-forward + Monte
 Carlo validation suite, ML labeling/training pipeline, risk engine and
 execution safeguards (paper-first), LLM trade-review layer, a worked example
 strategy wired end-to-end, the test suite that covers it all, and the

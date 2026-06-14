@@ -1,8 +1,9 @@
 # Getting Started: Pro
 
 You bought **Pro ($249, one-time)**: everything in Builder -- including every
-domain template -- plus the Shai-Hulud cybersecurity hardening suite we run in our
-own production bots. Pay once, own it.
+domain template -- plus the Quant Lab showcase, the Studio deploy-cockpit, and the
+Shai-Hulud cybersecurity hardening suite we run in our own production bots. Pay
+once, own it.
 
 ## 1. Activate your license
 
@@ -18,9 +19,10 @@ security hardening (no-sudo mode). Your license is saved to
 
 - Everything in **Starter** and **Builder** (full skill/agent toolkit + every
   domain template)
-- **Every domain template**: `trading`, `prediction-markets`, `indie-saas` --
-  each in `~/.claude/templates/<name>/`
+- **Every domain template**: `trading`, `prediction-markets`, `indie-saas`,
+  `devops-infra`, `web` -- each in `~/.claude/templates/<name>/`
 - The **cybersecurity hardening suite** (no-sudo parts installed automatically)
+- The **Quant Lab showcase** deployed to `~/QuantLab` (see step 4)
 
 ```bash
 ecc status      # SKU=pro
@@ -62,7 +64,32 @@ Alerts use **your own** Telegram bot, so no data leaves your control:
 5. Test: `~/.claude/.../fim-watchdog.sh --alert` should send an "all clear"
    message. (Path is shown by `ecc security --check`.)
 
-## 4. First run
+## 4. The Quant Lab showcase
+
+Pro deploys a production-shaped algotrading lab to `~/QuantLab` (its Python venv is
+pre-warmed at install). It is a **showcase**: paper-first, tools not signals, no live
+execution wired, and the bundled example deliberately fails its own go/no-go gate so you
+see what honest validation looks like.
+
+```bash
+ecc quantlab --doctor    # health check + offline smoke backtest
+ecc quantlab --setup     # (re)deploy the lab if needed
+```
+
+Quickstart:
+
+```bash
+cd ~/QuantLab
+.venv/bin/python -m strategies.sma_cross.backtest_example   # full pipeline
+.venv/bin/python -m pytest tests/ -q                        # the shipped test suite
+ecc cockpit    # then open the Trading Deck (deck switcher, top-left)
+```
+
+> The lab is paper-only; you assume all market and regulatory risk. Read
+> `~/QuantLab/docs/DISCLAIMER.md` before use. Your edits in `config/`, `strategies/`,
+> and `data/` survive `ecc quantlab --update`.
+
+## 5. First run
 
 ```bash
 claude
@@ -76,7 +103,7 @@ Deck lights up. Run it again for each of the others. See
 Then pick the template that fits the job and follow its
 `~/.claude/templates/<name>/WORKFLOW.md`.
 
-## 5. Everyday commands
+## 6. Everyday commands
 
 | Command | What it does |
 |---|---|

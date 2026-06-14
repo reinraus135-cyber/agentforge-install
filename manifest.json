@@ -1,6 +1,6 @@
 {
   "$schema": "https://agentforge.army/manifest/v2.json",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "product": "agentforge",
   "model": "one-time",
   "currency": "USD",
@@ -201,8 +201,8 @@
       "price_onetime": 249,
       "price_intro": 149,
       "intro_units": 1000,
-      "tagline": "Builder, plus the Shai-Hulud cybersecurity hardening suite we run on our own trading bots.",
-      "description": "Everything in Builder -- every developer skill and every domain template -- plus the same cybersecurity defenses we run in our production trading bots.",
+      "tagline": "Builder, plus the Quant Lab showcase, the Studio deploy-cockpit, and the Shai-Hulud cybersecurity hardening suite we run on our own trading bots.",
+      "description": "Everything in Builder -- every developer skill and every domain template -- plus the Quant Lab showcase (a production-shaped algotrading lab deployed to ~/QuantLab via 'ecc quantlab', paper-first; tools, not signals), the Studio deploy-cockpit, and the same cybersecurity defenses we run in our production trading bots.",
       "target_buyer": "Power users and security-conscious teams running Claude Code in production.",
       "includes_skus": ["builder"],
       "skills": [],
@@ -217,6 +217,7 @@
       ],
       "features": {
         "security_hardening": true,
+        "quant_lab": true,
         "template_picker": false,
         "free_updates_months": 12,
         "ioc_patch_delivery_months": 12
